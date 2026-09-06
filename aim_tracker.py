@@ -258,8 +258,19 @@ set_overlay_enabled(cfg.overlay_enabled)  # запускает грабер, е�
 
 
 # ---------- Детекция ----------
-def find_blobs_arr(arr1_bgr, arr2_bgr, threshold, min_area, denoise_kernel=0):
-    """То же самое, что раньше, но принимает готовые numpy-массивы (без PIL).
+def find_blobs_arr(arr1_bgra, arr2_bgra, threshold, min_area, denoise_kernel=0):
+    """Ищет пятна изменений между двумя кадрами.
+
+    Принимает сырые BGRA-кадры от mss как есть, без среза [:, :, :3]:
+    трёхканальный срез BGRA-массива не упакован (между пикселями 4 байта при
+    трёх каналах), и OpenCV вынужден копировать его целиком. Альфа у mss
+    константная, поэтому absdiff по ней всегда 0 и на максимум не влияет.
+
+    Разница считается через absdiff/max/threshold, то есть в uint8 и на SIMD.
+    Прежний np.abs(a.astype(int16) - b.astype(int16)).max(axis=2) аллоцировал
+    два int16-буфера размером с кадр и был на порядок дороже — на полном
+    экране именно он, а не разметка, съедал основную часть времени детекции.
+    Маска на выходе побитово та же, что и раньше.
 
     denoise_kernel > 0 применяет морфологическое "открытие" к маске перед
     разметкой связных областей — убирает единичные шумные пиксели ДО того,
@@ -268,8 +279,10 @@ def find_blobs_arr(arr1_bgr, arr2_bgr, threshold, min_area, denoise_kernel=0):
     сотни-тысячи крошечных пятен, и сама разметка становится дорогой —
     именно это было причиной скачков diff до 75-100мс.
     """
-    diff = np.abs(arr1_bgr.astype(np.int16) - arr2_bgr.astype(np.int16)).max(axis=2)
-    mask = (diff > threshold).astype(np.uint8)
+    diff = cv2.absdiff(arr1_bgra, arr2_bgra)
+    b, g, r = cv2.split(diff)[:3]
+    merged = cv2.max(cv2.max(b, g), r)
+    _, mask = cv2.threshold(merged, threshold, 1, cv2.THRESH_BINARY)
     if denoise_kernel > 0:
         kernel = np.ones((denoise_kernel, denoise_kernel), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -376,7 +389,7 @@ def maybe_save_last_frame(arr_bgr, bbox, region_w, region_h):
         max(y1 - CROP_PADDING, 0):min(y2 + CROP_PADDING, region_h),
         max(x1 - CROP_PADDING, 0):min(x2 + CROP_PADDING, region_w),
     ]
-    Image.fromarray(crop[:, :, ::-1]).save("last.jpg")  # BGR -> RGB для PIL
+    Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGRA2RGB)).save("last.jpg")  # BGRA -> RGB для PIL
 
 
 def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y):
@@ -386,8 +399,8 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
 
     region = {"left": region_left, "top": region_top, "width": region_w, "height": region_h}
     t0 = time.perf_counter()
-    arr1 = np.array(main_sct.grab(region), dtype=np.uint8)[:, :, :3]
-    arr2 = np.array(main_sct.grab(region), dtype=np.uint8)[:, :, :3]
+    arr1 = np.array(main_sct.grab(region), dtype=np.uint8)   # BGRA как есть, см. find_blobs_arr
+    arr2 = np.array(main_sct.grab(region), dtype=np.uint8)
     t1 = time.perf_counter()
 
     blobs = find_blobs_arr(arr1, arr2, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
@@ -436,8 +449,8 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
         return False
 
     t0 = time.perf_counter()
-    crop1 = prev[region_top:region_top + region_h, region_left:region_left + region_w, :3]
-    crop2 = current[region_top:region_top + region_h, region_left:region_left + region_w, :3]
+    crop1 = prev[region_top:region_top + region_h, region_left:region_left + region_w, :]
+    crop2 = current[region_top:region_top + region_h, region_left:region_left + region_w, :]
     blobs = find_blobs_arr(crop1, crop2, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
     t1 = time.perf_counter()
 
@@ -468,6 +481,29 @@ def track(region_left, region_top, region_w, region_h, offset_x, offset_y):
 
 
 # ---------- Бенчмарк ----------
+def dummy_frame_pair(h, w):
+    """Пара BGRA-кадров, похожая на реальную сцену.
+
+    Прежний бенчмарк брал два полностью случайных кадра: там отличался каждый
+    пиксель, маска выходила сплошной, связная область получалась ровно одна, и
+    разметка оказывалась подозрительно дешёвой — мерилось не то, что тормозит
+    в жизни. Здесь кадры почти одинаковые, с редким точечным шумом (вода, рука
+    с предметом) и несколькими настоящими пятнами — как раз тот случай, ради
+    которого добавлялся denoise_kernel.
+    """
+    rng = np.random.default_rng(0)
+    first = np.empty((h, w, 4), np.uint8)
+    first[:, :, :3] = rng.integers(50, 70, (h, w, 3), dtype=np.uint8)
+    first[:, :, 3] = 255
+    second = first.copy()
+    second[rng.random((h, w)) < 0.002, :3] = 255              # точечный шум
+    for _ in range(6):                                        # настоящие пятна
+        y = int(rng.integers(0, max(h - 12, 1)))
+        x = int(rng.integers(0, max(w - 12, 1)))
+        second[y:y + 10, x:x + 10, :3] = 255
+    return first, second
+
+
 def run_benchmark(samples=30):
     print("Замер производительности (может занять секунду)...")
     with mss.MSS() as sct:
@@ -484,16 +520,21 @@ def run_benchmark(samples=30):
             t0 = time.perf_counter(); sct.grab(small_region); t.append((time.perf_counter() - t0) * 1000)
         small_avg = sum(t) / samples
 
-    dummy1 = np.random.randint(0, 255, (margin * 2, margin * 2, 3), dtype=np.uint8)
-    dummy2 = np.random.randint(0, 255, (margin * 2, margin * 2, 3), dtype=np.uint8)
-    t0 = time.perf_counter()
-    for _ in range(samples):
-        find_blobs_arr(dummy1, dummy2, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
-    diff_avg = (time.perf_counter() - t0) / samples * 1000
+    def time_diff(h, w):
+        a, b = dummy_frame_pair(h, w)
+        find_blobs_arr(a, b, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)  # прогрев
+        t0 = time.perf_counter()
+        for _ in range(samples):
+            find_blobs_arr(a, b, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
+        return (time.perf_counter() - t0) / samples * 1000
+
+    diff_small = time_diff(margin * 2, margin * 2)
+    diff_full = time_diff(screen_height, screen_width)
 
     print(f"  Захват всего экрана ({screen_width}x{screen_height}): {full_avg:.1f} мс")
     print(f"  Захват области {margin*2}x{margin*2} (режим Ctrl):    {small_avg:.1f} мс")
-    print(f"  Поиск пятен (cv2) на области {margin*2}x{margin*2}:    {diff_avg:.1f} мс")
+    print(f"  Поиск пятен на области {margin*2}x{margin*2} (режим Ctrl): {diff_small:.1f} мс")
+    print(f"  Поиск пятен на всём экране (режим Alt):        {diff_full:.1f} мс")
     print("  Это ориентировочный потолок скорости на твоём железе для этих операций.")
 
 
@@ -501,20 +542,16 @@ def run_benchmark(samples=30):
 def print_help():
     print(
         "\nКоманды консоли:\n"
-        "  show                         — показать текущие настройки\n"
-        "  set <имя> <значение>         — изменить настройку (см. show)\n"
+        "  edit                         — меню всех переменных: значения, границы, описания\n"
+        "  show                         — то же самое, но коротким списком\n"
+        "  set <имя> <значение>         — изменить переменную\n"
+        "  set <имя>                    — показать одну переменную с описанием\n"
         "  log on|off                   — вкл/выкл подробные логи по каждой детекции\n"
         "  overlay on|off               — вкл/выкл рамку (F7 делает то же самое)\n"
         "  click on|off                 — вкл/выкл автоклик (F6 делает то же самое)\n"
         "  save on|off                  — сохранять last.jpg при детекции (тратит время!)\n"
         "  bench                        — замерить скорость захвата/детекции сейчас\n"
         "  help                         — эта справка\n"
-        "\nПоведение прицела (меняется через set):\n"
-        "  lock_radius <px>             — держаться за прежнюю цель, если она в этом радиусе\n"
-        "                                 (0 = выкл, курсор всегда прыгает на крупнейшее пятно)\n"
-        "  lock_timeout <сек>           — через сколько без детекций цель забывается\n"
-        "  move_smoothing <0.01-1.0>    — доля пути до цели за кадр (1.0 = мгновенно, 0.3 = плавно)\n"
-        "  dead_zone <px>               — не дёргать курсор, если цель ближе стольких пикселей\n"
     )
 
 
@@ -559,7 +596,7 @@ def apply_setting(name, raw):
     фоновый грабер не запускался и два режима разъезжались между собой.
     """
     if not hasattr(cfg, name):
-        print(f"Нет такой настройки: {name}. Введи 'show' для списка.")
+        print(f"Нет такой настройки: {name}. Введи 'edit' для списка с описаниями.")
         return
 
     current = getattr(cfg, name)
@@ -589,9 +626,94 @@ def apply_setting(name, raw):
     print(f"{name} = {value}")
 
 
+# Описания переменных для меню 'edit'. Порядок групп — порядок вывода.
+SETTINGS_GROUPS = [
+    ("Детекция", (
+        ("diff_threshold",    "порог разницы пикселей 0-255: ниже — чувствительнее, но больше шума"),
+        ("min_blob_area",     "минимальная площадь пятна, px: всё мельче отбрасывается"),
+        ("denoise_kernel",    "ядро фильтра точечного шума перед поиском пятен, px (0 = выкл)"),
+    )),
+    ("Прицел", (
+        ("lock_radius",       "радиус залипания на прежнюю цель, px (0 = выкл, всегда крупнейшее пятно)"),
+        ("lock_timeout",      "через сколько секунд без детекций прежняя цель забывается"),
+        ("move_smoothing",    "доля пути до цели за кадр: 1.0 = мгновенно, 0.3 = плавно для записи"),
+        ("dead_zone",         "не двигать курсор, если цель ближе стольких пикселей"),
+        ("move_duration",     "длительность самого движения мыши, сек (0 = мгновенный прыжок)"),
+    )),
+    ("Скорость", (
+        ("scan_interval",     "пауза между итерациями главного цикла, сек"),
+        ("hide_settle_delay", "пауза после скрытия рамок перед захватом, сек (только режим с оверлеем)"),
+    )),
+    ("Режимы и вывод", (
+        ("overlay_enabled",   "рамка оверлея: on = точнее и медленнее, off = быстрый режим (F7)"),
+        ("auto_click",        "кликать после наведения (F6)"),
+        ("debug_log",         "печатать таймлог каждой детекции"),
+        ("save_last_frame",   "сохранять last.jpg при детекции — запись на диск добавляет задержку"),
+    )),
+]
+
+SETTINGS_INFO = {name: desc for _, items in SETTINGS_GROUPS for name, desc in items}
+
+
+def settings_groups_full():
+    """Группы для меню плюс всё, что есть в Config, но забыто в SETTINGS_GROUPS.
+
+    Так новая настройка не исчезнет из 'edit' молча, если про описание забыли.
+    """
+    forgotten = [n for n in vars(cfg) if n not in SETTINGS_INFO]
+    if forgotten:
+        return list(SETTINGS_GROUPS) + [("Без описания", tuple((n, "") for n in forgotten))]
+    return list(SETTINGS_GROUPS)
+
+
+def range_hint(name, value):
+    if isinstance(value, bool):
+        return "on/off"
+    low, high = MIN_VALUES.get(name), MAX_VALUES.get(name)
+    if low is None and high is None:
+        return ""
+    if high is None:
+        return f"от {low}"
+    return f"{low}..{high}"
+
+
+def format_value(value):
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return str(value)
+
+
+def print_settings_menu():
+    print("\nНастраиваемые переменные. 'set <имя> <значение>' — изменить,")
+    print("'set <имя>' — показать одну с описанием.\n")
+    for title, items in settings_groups_full():
+        print(f"  {title}")
+        for name, desc in items:
+            value = getattr(cfg, name)
+            hint = range_hint(name, value)
+            hint = f"[{hint}]" if hint else ""
+            print(f"    {name:<18}= {format_value(value):<7} {hint:<11} {desc}")
+        print()
+
+
+def describe_setting(name):
+    if not hasattr(cfg, name):
+        print(f"Нет такой настройки: {name}. Введи 'edit' для списка.")
+        return
+    value = getattr(cfg, name)
+    hint = range_hint(name, value)
+    print(f"  {name} = {format_value(value)}" + (f"   [{hint}]" if hint else ""))
+    desc = SETTINGS_INFO.get(name)
+    if desc:
+        print(f"    {desc}")
+    print(f"    изменить: set {name} <значение>")
+
+
 def print_settings():
     for name, value in vars(cfg).items():
-        print(f"  {name} = {value}")
+        print(f"  {name} = {format_value(value)}")
 
 
 def console_loop():
@@ -620,8 +742,15 @@ def console_loop():
                 cfg.save_last_frame = parse_bool(parts[1])
             elif cmd == "bench":
                 run_benchmark()
+            elif cmd == "edit":
+                print_settings_menu()
             elif cmd == "set":
-                apply_setting(parts[1], parts[2])
+                if len(parts) == 1:
+                    print("Формат: set <имя> <значение>. Введи 'edit', чтобы увидеть все переменные.")
+                elif len(parts) == 2:
+                    describe_setting(parts[1])          # без значения — показываем текущее и описание
+                else:
+                    apply_setting(parts[1], parts[2])
             else:
                 print("Неизвестная команда. Введи 'help'.")
         except (IndexError, ValueError):
