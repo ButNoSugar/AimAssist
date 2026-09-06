@@ -35,6 +35,10 @@ class Config:
         self.move_duration = 0.0        # плавность движения мыши (0 = мгновенно, быстрее всего)
         self.hide_settle_delay = 0.02   # пауза после скрытия рамок (только режим с оверлеем)
         self.denoise_kernel = 3         # размер ядра фильтра шума перед поиском пятен (0 = выкл)
+        self.lock_radius = 120          # радиус залипания на цель в пикселях (0 = выкл)
+        self.lock_timeout = 0.35        # через столько секунд без детекций цель забывается (сек)
+        self.move_smoothing = 1.0       # доля пути до цели за кадр: 1.0 = мгновенно, 0.3 = плавно
+        self.dead_zone = 0              # не двигать курсор, если цель ближе стольких пикселей
         self.debug_log = True           # печатать таймлоги каждой детекции
         self.save_last_frame = False    # сохранять last.jpg (лишняя запись на диск = задержка)
         self.auto_click = False
@@ -193,6 +197,14 @@ main_sct = mss.MSS()  # для синхронного режима (исполь
 _prev_holder = {"frame": None}
 _last_used_ts = 0.0
 
+_lock = {"pos": None, "ts": 0.0, "held": False}
+
+
+def reset_lock():
+    _lock["pos"] = None
+    _lock["ts"] = 0.0
+    _lock["held"] = False
+
 
 def set_overlay_enabled(enabled):
     global _last_used_ts
@@ -204,6 +216,7 @@ def set_overlay_enabled(enabled):
         _prev_holder["frame"] = None
         _last_used_ts = 0.0
         grabber.start()
+    reset_lock()
     print(f"[Оверлей] {'ВКЛ (точнее, но медленнее)' if enabled else 'ВЫКЛ (быстрый режим, фоновый захват)'}")
 
 
@@ -287,7 +300,69 @@ def clamp_to_safe_area(x, y):
     return x, y
 
 
+def select_target(blobs, offset_x, offset_y):
+    """Выбирает пятно, за которым следим, и переставляет его в начало списка.
+
+    Без залипания целью каждый кадр становится просто самое крупное пятно, и
+    курсор прыгает между разными пятнами, как только их площади меняются
+    местами — на записи это выглядит как дёрганье. Если предыдущая цель ещё
+    "жива" (с последней детекции прошло меньше lock_timeout) и в радиусе
+    lock_radius от неё есть пятно, держимся за ближайшее к ней, а не за
+    самое большое.
+
+    Пятно-цель ставится в blobs[0], поэтому вся логика ниже по коду
+    (зелёная рамка, срез MAX_BLOBS_SHOWN) продолжает работать как раньше.
+    """
+    blobs.sort(key=lambda b: b["area"], reverse=True)
+    chosen = 0
+    prev = _lock["pos"]
+    now = time.perf_counter()
+
+    if prev is not None and cfg.lock_radius > 0 and now - _lock["ts"] <= cfg.lock_timeout:
+        px, py = prev
+        best_d2 = cfg.lock_radius * cfg.lock_radius
+        for i, b in enumerate(blobs):
+            dx = offset_x + b["center"][0] - px
+            dy = offset_y + b["center"][1] - py
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d2:
+                best_d2 = d2
+                chosen = i
+
+    if chosen:
+        blobs.insert(0, blobs.pop(chosen))
+
+    primary = blobs[0]
+    _lock["pos"] = (offset_x + primary["center"][0], offset_y + primary["center"][1])
+    _lock["ts"] = now
+    _lock["held"] = bool(chosen)
+    return primary
+
+
 def move_and_maybe_click(x, y):
+    """Ведёт курсор к цели (x, y) в экранных координатах.
+
+    move_smoothing < 1.0 — экспоненциальное сглаживание: за кадр проходим
+    только эту долю пути до цели. Поскольку цикл слежения крутится непрерывно,
+    курсор подъезжает к цели за несколько кадров вместо телепорта — движение
+    получается похожим на человеческое. dead_zone гасит микродёрганье на
+    один-два пикселя.
+
+    Оба выключены по умолчанию (1.0 и 0), потому что включённая мёртвая зона
+    добавляет в горячий путь вызов pyautogui.position().
+    """
+    if cfg.move_smoothing < 1.0 or cfg.dead_zone > 0:
+        cur_x, cur_y = pyautogui.position()
+        dx, dy = x - cur_x, y - cur_y
+        if dx * dx + dy * dy <= cfg.dead_zone * cfg.dead_zone:
+            if cfg.auto_click:
+                pyautogui.click()
+            return
+        if cfg.move_smoothing < 1.0:
+            x = cur_x + dx * cfg.move_smoothing
+            y = cur_y + dy * cfg.move_smoothing
+
+    x, y = clamp_to_safe_area(x, y)
     pyautogui.moveTo(x, y, duration=cfg.move_duration)
     if cfg.auto_click:
         pyautogui.click()
@@ -321,8 +396,7 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
     if not blobs:
         return False
 
-    blobs.sort(key=lambda b: b["area"], reverse=True)
-    primary = blobs[0]
+    primary = select_target(blobs, offset_x, offset_y)
     screen_boxes = [
         (offset_x + x1, offset_y + y1, offset_x + x2, offset_y + y2)
         for (x1, y1, x2, y2) in (b["bbox"] for b in blobs[:MAX_BLOBS_SHOWN])
@@ -331,14 +405,15 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
     t3 = time.perf_counter()
 
     local_cx, local_cy = primary["center"]
-    screen_cx, screen_cy = clamp_to_safe_area(offset_x + local_cx, offset_y + local_cy)
+    screen_cx, screen_cy = offset_x + local_cx, offset_y + local_cy
     maybe_save_last_frame(arr2, primary["bbox"], region_w, region_h)
     move_and_maybe_click(screen_cx, screen_cy)
     t4 = time.perf_counter()
 
     if cfg.debug_log:
         print(
-            f"[sync] пятен={len(blobs)} area={primary['area']}px -> ({screen_cx},{screen_cy}) | "
+            f"[sync] пятен={len(blobs)}{' [lock]' if _lock['held'] else ''} "
+            f"area={primary['area']}px -> ({screen_cx},{screen_cy}) | "
             f"захват={((t1 - t0) * 1000):.1f}мс diff={((t2 - t1) * 1000):.1f}мс "
             f"оверлей={((t3 - t2) * 1000):.1f}мс move={((t4 - t3) * 1000):.1f}мс "
             f"| итого={((t4 - t0) * 1000):.1f}мс"
@@ -369,17 +444,17 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
     if not blobs:
         return False
 
-    blobs.sort(key=lambda b: b["area"], reverse=True)
-    primary = blobs[0]
+    primary = select_target(blobs, offset_x, offset_y)
     local_cx, local_cy = primary["center"]
-    screen_cx, screen_cy = clamp_to_safe_area(offset_x + local_cx, offset_y + local_cy)
+    screen_cx, screen_cy = offset_x + local_cx, offset_y + local_cy
     maybe_save_last_frame(crop2, primary["bbox"], region_w, region_h)
     move_and_maybe_click(screen_cx, screen_cy)
     t2 = time.perf_counter()
 
     if cfg.debug_log:
         print(
-            f"[fast] пятен={len(blobs)} area={primary['area']}px -> ({screen_cx},{screen_cy}) | "
+            f"[fast] пятен={len(blobs)}{' [lock]' if _lock['held'] else ''} "
+            f"area={primary['area']}px -> ({screen_cx},{screen_cy}) | "
             f"diff={((t1 - t0) * 1000):.1f}мс move={((t2 - t1) * 1000):.1f}мс "
             f"| захват фоном ~{grabber.capture_time_ms:.1f}мс/кадр"
         )
@@ -434,6 +509,12 @@ def print_help():
         "  save on|off                  — сохранять last.jpg при детекции (тратит время!)\n"
         "  bench                        — замерить скорость захвата/детекции сейчас\n"
         "  help                         — эта справка\n"
+        "\nПоведение прицела (меняется через set):\n"
+        "  lock_radius <px>             — держаться за прежнюю цель, если она в этом радиусе\n"
+        "                                 (0 = выкл, курсор всегда прыгает на крупнейшее пятно)\n"
+        "  lock_timeout <сек>           — через сколько без детекций цель забывается\n"
+        "  move_smoothing <0.01-1.0>    — доля пути до цели за кадр (1.0 = мгновенно, 0.3 = плавно)\n"
+        "  dead_zone <px>               — не дёргать курсор, если цель ближе стольких пикселей\n"
     )
 
 
@@ -448,6 +529,15 @@ MIN_VALUES = {
     "move_duration": 0.0,
     "hide_settle_delay": 0.0,
     "denoise_kernel": 0,
+    "lock_radius": 0,
+    "lock_timeout": 0.0,
+    "move_smoothing": 0.01,   # 0 полностью заморозило бы курсор
+    "dead_zone": 0,
+}
+
+# верхние границы (нужны только там, где значение — доля)
+MAX_VALUES = {
+    "move_smoothing": 1.0,
 }
 
 
@@ -486,6 +576,9 @@ def apply_setting(name, raw):
 
     if name in MIN_VALUES and value < MIN_VALUES[name]:
         print(f"{name} не может быть меньше {MIN_VALUES[name]}")
+        return
+    if name in MAX_VALUES and value > MAX_VALUES[name]:
+        print(f"{name} не может быть больше {MAX_VALUES[name]}")
         return
 
     if name == "overlay_enabled":          # смена режима — только через сеттер
@@ -542,6 +635,7 @@ print("\nЗажми Ctrl — слежение в области у центра 
 print("Зажми Alt — слежение по всему экрану.")
 print(f"{AUTOCLICK_TOGGLE_KEY.upper()} / 'click on|off' — автоклик.")
 print(f"{OVERLAY_TOGGLE_KEY.upper()} / 'overlay on|off' — рамка оверлея (выключи для максимальной скорости).")
+print("Для плавного движения на записи: 'set move_smoothing 0.3' и 'set dead_zone 2'.")
 
 try:
     while True:
