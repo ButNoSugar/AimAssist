@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# рабочий вывод скрипта и локальные настройки
+last.jpg
+aim_config.json
+aim_config.json.bak
