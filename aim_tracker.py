@@ -1,4 +1,6 @@
 import ctypes
+import json
+import os
 import threading
 import time
 
@@ -29,6 +31,7 @@ FAILSAFE_MARGIN = 2  # на столько пикселей держимся п�
 # ---------- Настройки, изменяемые на лету через консоль ----------
 class Config:
     def __init__(self):
+        self.margin = 100               # отступ от центра до края области слежения (режим Ctrl), px
         self.scan_interval = 0.005      # пауза между итерациями главного цикла (сек)
         self.diff_threshold = 30        # порог чувствительности разницы пикселей (0-255)
         self.min_blob_area = 4          # мин. площадь пятна в пикселях (отсекает шум)
@@ -44,6 +47,8 @@ class Config:
         self.auto_click = False
         self.overlay_enabled = True     # True = точный, но медленный синхронный режим
                                          # False = быстрый режим с фоновым захватом экрана
+        self.autosave = True            # сохранять активный профиль при выходе
+        self.bench_on_boot = True       # прогонять бенчмарк один раз за загрузку компьютера
 
 
 cfg = Config()
@@ -236,7 +241,7 @@ def ask_margin():
     ожидает детектор. Раньше здесь был голый int(input(...)) — пустая строка
     или буква роняли скрипт на старте.
     """
-    max_margin = min(center_x, center_y)
+    max_margin = MAX_VALUES["margin"]
     while True:
         try:
             raw = input(f"Введите отступ от центра экрана (для режима Ctrl), 1-{max_margin}: ").strip()
@@ -253,8 +258,6 @@ def ask_margin():
         return value
 
 
-margin = ask_margin()
-set_overlay_enabled(cfg.overlay_enabled)  # запускает грабер, если оверлей изначально выключен
 
 
 # ---------- Детекция ----------
@@ -505,7 +508,10 @@ def dummy_frame_pair(h, w):
 
 
 def run_benchmark(samples=30):
+    """Меряет захват и детекцию. Печатает результат и возвращает его текстом,
+    чтобы конфиг мог показать его при следующем запуске, не меряя заново."""
     print("Замер производительности (может занять секунду)...")
+    margin = int(cfg.margin)
     with mss.MSS() as sct:
         full_region = {"left": 0, "top": 0, "width": screen_width, "height": screen_height}
         small_region = {"left": center_x - margin, "top": center_y - margin, "width": margin * 2, "height": margin * 2}
@@ -531,11 +537,15 @@ def run_benchmark(samples=30):
     diff_small = time_diff(margin * 2, margin * 2)
     diff_full = time_diff(screen_height, screen_width)
 
-    print(f"  Захват всего экрана ({screen_width}x{screen_height}): {full_avg:.1f} мс")
-    print(f"  Захват области {margin*2}x{margin*2} (режим Ctrl):    {small_avg:.1f} мс")
-    print(f"  Поиск пятен на области {margin*2}x{margin*2} (режим Ctrl): {diff_small:.1f} мс")
-    print(f"  Поиск пятен на всём экране (режим Alt):        {diff_full:.1f} мс")
-    print("  Это ориентировочный потолок скорости на твоём железе для этих операций.")
+    text = "\n".join([
+        f"  Захват всего экрана ({screen_width}x{screen_height}): {full_avg:.1f} мс",
+        f"  Захват области {margin*2}x{margin*2} (режим Ctrl):    {small_avg:.1f} мс",
+        f"  Поиск пятен на области {margin*2}x{margin*2} (режим Ctrl): {diff_small:.1f} мс",
+        f"  Поиск пятен на всём экране (режим Alt):        {diff_full:.1f} мс",
+        "  Это ориентировочный потолок скорости на твоём железе для этих операций.",
+    ])
+    print(text)
+    return text
 
 
 # ---------- Консольное управление настройками ----------
@@ -551,6 +561,9 @@ def print_help():
         "  click on|off                 — вкл/выкл автоклик (F6 делает то же самое)\n"
         "  save on|off                  — сохранять last.jpg при детекции (тратит время!)\n"
         "  bench                        — замерить скорость захвата/детекции сейчас\n"
+        "  profiles                     — страница профилей: список и команды\n"
+        "  profile save|load|delete|default|defaults\n"
+        "  reset_config                 — стереть файл конфига (спросит подтверждение)\n"
         "  help                         — эта справка\n"
     )
 
@@ -570,11 +583,13 @@ MIN_VALUES = {
     "lock_timeout": 0.0,
     "move_smoothing": 0.01,   # 0 полностью заморозило бы курсор
     "dead_zone": 0,
+    "margin": 1,
 }
 
 # верхние границы (нужны только там, где значение — доля)
 MAX_VALUES = {
     "move_smoothing": 1.0,
+    "margin": min(center_x, center_y),   # больше — область слежения вылезет за край экрана
 }
 
 
@@ -587,48 +602,65 @@ def parse_bool(raw):
     raise ValueError(f"ожидалось on/off, а не {raw!r}")
 
 
-def apply_setting(name, raw):
-    """Записывает настройку, приводя значение к типу текущего.
+def coerce_setting(name, raw):
+    """Приводит значение к типу текущей настройки. Бросает ValueError.
 
-    Раньше здесь был безусловный float(): 'set denoise_kernel 3' записывал 3.0,
-    и np.ones((3.0, 3.0)) падал с TypeError прямо в цикле детекции. А
-    'set overlay_enabled 0' писал 0.0 в обход set_overlay_enabled(), из-за чего
-    фоновый грабер не запускался и два режима разъезжались между собой.
+    Раньше в 'set' стоял безусловный float(): 'set denoise_kernel 3' записывал
+    3.0, и np.ones((3.0, 3.0)) падал с TypeError прямо в цикле детекции.
+    Тем же путём идут значения из файла конфига — его правят руками, так что
+    доверия к нему не больше, чем к вводу с клавиатуры.
     """
+    current = getattr(cfg, name)
+    if isinstance(current, bool):          # bool наследуется от int — проверяем его первым
+        return parse_bool(raw) if isinstance(raw, str) else bool(raw)
+    if isinstance(current, int):
+        return int(float(raw))
+    return float(raw)
+
+
+def bounds_error(name, value):
+    """Текст ошибки, если значение вне допустимого диапазона, иначе None."""
+    if name in MIN_VALUES and value < MIN_VALUES[name]:
+        return f"{name} не может быть меньше {MIN_VALUES[name]}"
+    if name in MAX_VALUES and value > MAX_VALUES[name]:
+        return f"{name} не может быть больше {MAX_VALUES[name]}"
+    return None
+
+
+def assign_setting(name, value):
+    """Кладёт проверенное значение в cfg.
+
+    overlay_enabled идёт только через сеттер: он останавливает и запускает
+    фоновый грабер, и запись напрямую развела бы режимы между собой.
+    """
+    if name == "overlay_enabled":
+        set_overlay_enabled(value)
+    else:
+        setattr(cfg, name, value)
+
+
+def apply_setting(name, raw):
     if not hasattr(cfg, name):
         print(f"Нет такой настройки: {name}. Введи 'edit' для списка с описаниями.")
         return
-
-    current = getattr(cfg, name)
     try:
-        if isinstance(current, bool):      # bool наследуется от int — проверяем его первым
-            value = parse_bool(raw)
-        elif isinstance(current, int):
-            value = int(float(raw))
-        else:
-            value = float(raw)
+        value = coerce_setting(name, raw)
     except ValueError as exc:
         print(f"Не могу разобрать значение для {name}: {exc}")
         return
-
-    if name in MIN_VALUES and value < MIN_VALUES[name]:
-        print(f"{name} не может быть меньше {MIN_VALUES[name]}")
+    error = bounds_error(name, value)
+    if error:
+        print(error)
         return
-    if name in MAX_VALUES and value > MAX_VALUES[name]:
-        print(f"{name} не может быть больше {MAX_VALUES[name]}")
-        return
-
-    if name == "overlay_enabled":          # смена режима — только через сеттер
-        set_overlay_enabled(value)
-        return
-
-    setattr(cfg, name, value)
-    print(f"{name} = {value}")
+    assign_setting(name, value)
+    if name != "overlay_enabled":          # сеттер печатает своё сообщение
+        print(f"{name} = {format_value(value)}")
 
 
 # Описания переменных для меню 'edit'. Порядок групп — порядок вывода.
 SETTINGS_GROUPS = [
     ("Детекция", (
+        ("margin",            "отступ от центра до края области слежения в режиме Ctrl, px"),
         ("diff_threshold",    "порог разницы пикселей 0-255: ниже — чувствительнее, но больше шума"),
         ("min_blob_area",     "минимальная площадь пятна, px: всё мельче отбрасывается"),
         ("denoise_kernel",    "ядро фильтра точечного шума перед поиском пятен, px (0 = выкл)"),
@@ -649,6 +681,8 @@ SETTINGS_GROUPS = [
         ("auto_click",        "кликать после наведения (F6)"),
         ("debug_log",         "печатать таймлог каждой детекции"),
         ("save_last_frame",   "сохранять last.jpg при детекции — запись на диск добавляет задержку"),
+        ("autosave",          "сохранять активный профиль при выходе"),
+        ("bench_on_boot",     "гонять бенчмарк один раз за загрузку компьютера, а не каждый старт"),
     )),
 ]
 
@@ -716,6 +750,307 @@ def print_settings():
         print(f"  {name} = {format_value(value)}")
 
 
+# ---------- Конфиг: профили настроек ----------
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aim_config.json")
+DEFAULT_PROFILE_NAME = "default"
+
+# data — содержимое файла, active — какой профиль сейчас правится в памяти.
+# autosave_ok выключается там, где сохранение при выходе уничтожило бы то,
+# что пользователь только что осознанно сделал: стёр конфиг или вернул
+# встроенные значения. Явные 'profile save'/'profile load' включают обратно.
+_config = {"data": None, "active": DEFAULT_PROFILE_NAME, "autosave_ok": True}
+
+# Конфиг трогают два потока: консольный (команды profile/reset_config) и
+# главный (автосохранение при выходе). RLock, потому что операции вложены —
+# profile_delete внутри себя зовёт save_config_file.
+_config_lock = threading.RLock()
+
+
+def builtin_defaults():
+    """Встроенные значения — из класса Config, а не из файла.
+
+    Поэтому скрипт запускается и без aim_config.json, а 'profile defaults'
+    всегда может вернуть заведомо рабочий набор, даже если в файле намешано.
+    """
+    return vars(Config())
+
+
+def empty_config():
+    return {"version": 1, "default_profile": DEFAULT_PROFILE_NAME, "profiles": {}, "bench": {}}
+
+
+def load_config_file():
+    """Читает конфиг. Возвращает dict, или None если файла нет / он битый.
+
+    Битый файл не затирается, а переименовывается в .bak: там могут быть
+    профили, которые пользователь подбирал руками.
+    """
+    if not os.path.exists(CONFIG_PATH):
+        return None
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
+            raise ValueError("нет секции profiles")
+    except (OSError, ValueError) as exc:
+        print(f"[Конфиг] {CONFIG_PATH} не читается ({exc}).")
+        try:
+            os.replace(CONFIG_PATH, CONFIG_PATH + ".bak")
+            print(f"[Конфиг] Отложен в {CONFIG_PATH}.bak, начинаю с чистого.")
+        except OSError as exc2:
+            print(f"[Конфиг] Переименовать тоже не вышло: {exc2}")
+        return None
+    data.setdefault("version", 1)
+    data.setdefault("default_profile", DEFAULT_PROFILE_NAME)
+    data.setdefault("bench", {})
+    return data
+
+
+def save_config_file():
+    with _config_lock:
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+                json.dump(_config["data"], handle, ensure_ascii=False, indent=2, sort_keys=True)
+            return True
+        except OSError as exc:
+            print(f"[Конфиг] Не могу записать {CONFIG_PATH}: {exc}")
+            return False
+
+
+def current_values():
+    return dict(vars(cfg))
+
+
+def profile_names():
+    return sorted(_config["data"]["profiles"])
+
+
+def apply_values(values):
+    """Загружает набор значений в cfg, пропуская всё, что не проходит проверку.
+
+    Значения идут через те же coerce/bounds, что и команда 'set': файл
+    правится руками, и одна опечатка не должна ронять запуск.
+    """
+    skipped = []
+    for name, raw in values.items():
+        if not hasattr(cfg, name):
+            skipped.append(f"{name} (нет такой настройки)")
+            continue
+        try:
+            value = coerce_setting(name, raw)
+        except (ValueError, TypeError):
+            skipped.append(f"{name} (не разобрать {raw!r})")
+            continue
+        error = bounds_error(name, value)
+        if error:
+            skipped.append(f"{name} ({error})")
+            continue
+        assign_setting(name, value)
+    if skipped:
+        print("[Конфиг] Пропущено: " + "; ".join(skipped))
+
+
+def confirm(question):
+    try:
+        return input(f"{question} [y/N]: ").strip().lower() in ("y", "yes", "д", "да")
+    except EOFError:
+        return False
+
+
+def profile_save(name=None):
+    with _config_lock:
+        name = name or _config["active"]
+        _config["data"]["profiles"][name] = current_values()
+        _config["active"] = name
+        _config["autosave_ok"] = True
+        if save_config_file():
+            print(f"[Профиль] Сохранён: {name}")
+
+
+def profile_load(name):
+    with _config_lock:
+        values = _config["data"]["profiles"].get(name)
+        if values is None:
+            print(f"[Профиль] Нет профиля {name!r}. 'profiles' — список.")
+            return
+        apply_values(values)
+        _config["active"] = name
+        _config["autosave_ok"] = True
+        print(f"[Профиль] Загружен: {name}")
+
+
+def profile_delete(name):
+    # confirm() ждёт ввода, поэтому спрашиваем ДО взятия замка: иначе выход из
+    # скрипта во время висящего вопроса заклинил бы автосохранение навсегда.
+    with _config_lock:
+        if name not in _config["data"]["profiles"]:
+            print(f"[Профиль] Нет профиля {name!r}.")
+            return
+    if not confirm(f"Удалить профиль {name!r}?"):
+        print("Отменено.")
+        return
+    with _config_lock:
+        if name not in _config["data"]["profiles"]:
+            return                      # успели удалить, пока мы спрашивали
+        del _config["data"]["profiles"][name]
+        if _config["data"]["default_profile"] == name:
+            _config["data"]["default_profile"] = DEFAULT_PROFILE_NAME
+        if _config["active"] == name:
+            _config["active"] = _config["data"]["default_profile"]
+        if save_config_file():
+            print(f"[Профиль] Удалён: {name}")
+
+
+def profile_set_default(name):
+    with _config_lock:
+        if name not in _config["data"]["profiles"]:
+            print(f"[Профиль] Нет профиля {name!r}. Сначала сохрани: profile save {name}")
+            return
+        _config["data"]["default_profile"] = name
+        if save_config_file():
+            print(f"[Профиль] При запуске будет грузиться: {name}")
+
+
+def profile_defaults():
+    with _config_lock:
+        apply_values(builtin_defaults())
+        _config["autosave_ok"] = False    # иначе выход затёр бы профиль дефолтами
+        print("[Профиль] Загружены встроенные значения из кода. Файл не тронут,")
+        print(f"          и профиль {_config['active']!r} при выходе тоже не перезапишется.")
+        print("          Чтобы закрепить — 'profile save'.")
+
+
+def reset_config():
+    if not confirm(f"Стереть {os.path.basename(CONFIG_PATH)} со всеми профилями?"):
+        print("Отменено.")
+        return
+    with _config_lock:
+        _config["data"] = empty_config()
+        _config["active"] = DEFAULT_PROFILE_NAME
+        apply_values(builtin_defaults())
+        try:
+            if os.path.exists(CONFIG_PATH):
+                os.remove(CONFIG_PATH)
+            _config["autosave_ok"] = False   # иначе выход тут же создал бы файл заново
+            print("[Конфиг] Файл удалён, настройки вернулись к встроенным.")
+            print("          При выходе он не будет создан заново — если передумаешь,")
+            print("          сохрани явно: 'profile save'.")
+        except OSError as exc:
+            print(f"[Конфиг] Не могу удалить файл: {exc}")
+
+
+def print_profiles_page():
+    data = _config["data"]
+    print(f"\nПрофили настроек — {CONFIG_PATH}\n")
+    names = profile_names()
+    if not names:
+        print("  (ни одного не сохранено; работают встроенные значения из кода)")
+    for name in names:
+        marks = []
+        if name == _config["active"]:
+            marks.append("активный")
+        if name == data["default_profile"]:
+            marks.append("грузится при запуске")
+        print(f"  {name}" + (f"   <- {', '.join(marks)}" if marks else ""))
+    print(
+        "\n  profile save [имя]     — сохранить текущие настройки в профиль\n"
+        "  profile load <имя>     — загрузить профиль\n"
+        "  profile delete <имя>   — удалить профиль (спросит подтверждение)\n"
+        "  profile default <имя>  — какой профиль грузить при запуске\n"
+        "  profile defaults       — вернуть встроенные значения из кода\n"
+        "  reset_config           — стереть файл целиком (спросит подтверждение)\n"
+    )
+
+
+def run_profile_command(args):
+    if not args:
+        print_profiles_page()
+        return
+    sub_cmd = args[0].lower()
+    name = args[1] if len(args) > 1 else None
+    if sub_cmd == "save":
+        profile_save(name)
+    elif sub_cmd == "defaults":
+        profile_defaults()
+    elif sub_cmd in ("load", "delete", "default"):
+        if not name:
+            print(f"Формат: profile {sub_cmd} <имя>")
+        elif sub_cmd == "load":
+            profile_load(name)
+        elif sub_cmd == "delete":
+            profile_delete(name)
+        else:
+            profile_set_default(name)
+    else:
+        print("Не понял. 'profiles' — список профилей и доступные команды.")
+
+
+def boot_id():
+    """Метка текущей загрузки системы, чтобы бенчмарк шёл раз за загрузку.
+
+    GetTickCount64 отдаёт аптайм в миллисекундах, значит момент загрузки =
+    сейчас минус аптайм. Округляем до 10 секунд: иначе дрожание таймеров
+    делало бы каждый запуск "новой загрузкой". None — API недоступен, тогда
+    ориентируемся просто на наличие сохранённого замера.
+    """
+    try:
+        uptime_seconds = ctypes.windll.kernel32.GetTickCount64() / 1000.0
+    except (AttributeError, OSError):
+        return None
+    return int((time.time() - uptime_seconds) / 10)
+
+
+def maybe_run_startup_benchmark():
+    with _config_lock:
+        saved = _config["data"].get("bench") or {}
+        have_saved = bool(saved.get("text"))
+        current_boot = boot_id()
+
+        if have_saved and not cfg.bench_on_boot:
+            print("\nПоследний замер (bench_on_boot выключен, 'bench' — перемерить):")
+            print(saved["text"])
+            return
+        if have_saved and (current_boot is None or saved.get("boot") == current_boot):
+            print("\nЗамер с этой загрузки компьютера ('bench' — перемерить):")
+            print(saved["text"])
+            return
+
+        _config["data"]["bench"] = {"boot": current_boot, "text": run_benchmark()}
+        save_config_file()
+
+
+def startup_load_config():
+    """Готовит настройки к работе: файл -> профиль по умолчанию -> margin.
+
+    Файла нет — это первый запуск: спрашиваем margin, как раньше, и сразу
+    сохраняем профиль, чтобы больше не спрашивать.
+    """
+    data = load_config_file()
+    if data is None:
+        _config["data"] = empty_config()
+        cfg.margin = ask_margin()
+        _config["data"]["profiles"][DEFAULT_PROFILE_NAME] = current_values()
+        if save_config_file():
+            print(f"[Конфиг] Создан {CONFIG_PATH}")
+        return
+
+    _config["data"] = data
+    name = data["default_profile"]
+    if name not in data["profiles"]:
+        available = profile_names()
+        if not available:
+            print("[Конфиг] В файле нет профилей — работаю на встроенных значениях.")
+            return
+        name = available[0]
+        print(f"[Конфиг] Профиль {data['default_profile']!r} не найден, беру {name!r}.")
+    apply_values(data["profiles"][name])
+    _config["active"] = name
+    # экран мог смениться с прошлого запуска — сохранённый margin может не влезать
+    cfg.margin = max(MIN_VALUES["margin"], min(int(cfg.margin), MAX_VALUES["margin"]))
+    print(f"[Конфиг] Профиль: {name}   margin={cfg.margin}")
+
+
+
 def console_loop():
     print_help()
     while True:
@@ -744,6 +1079,12 @@ def console_loop():
                 run_benchmark()
             elif cmd == "edit":
                 print_settings_menu()
+            elif cmd == "profiles":
+                print_profiles_page()
+            elif cmd == "profile":
+                run_profile_command(parts[1:])
+            elif cmd == "reset_config":
+                reset_config()
             elif cmd == "set":
                 if len(parts) == 1:
                     print("Формат: set <имя> <значение>. Введи 'edit', чтобы увидеть все переменные.")
@@ -757,19 +1098,27 @@ def console_loop():
             print("Неверный формат команды. Введи 'help'.")
 
 
+startup_load_config()
+set_overlay_enabled(cfg.overlay_enabled)  # запускает грабер, если оверлей выключен
+# Бенчмарк — до запуска консоли: иначе команда из консоли (например
+# reset_config) успевала отработать в середине замера, а завершавшийся
+# следом бенчмарк своим save_config_file() воскрешал только что удалённый файл.
+maybe_run_startup_benchmark()
 threading.Thread(target=console_loop, daemon=True).start()
-run_benchmark()
 
 print("\nЗажми Ctrl — слежение в области у центра экрана.")
 print("Зажми Alt — слежение по всему экрану.")
 print(f"{AUTOCLICK_TOGGLE_KEY.upper()} / 'click on|off' — автоклик.")
 print(f"{OVERLAY_TOGGLE_KEY.upper()} / 'overlay on|off' — рамка оверлея (выключи для максимальной скорости).")
 print("Для плавного движения на записи: 'set move_smoothing 0.3' и 'set dead_zone 2'.")
+print("'edit' — все настройки, 'profiles' — профили. Отступ Ctrl меняется на лету: 'set margin 150'.")
 
 try:
     while True:
         found = False
         if keyboard.is_pressed(TRACK_KEY):
+            # снимок на итерацию: margin правится из консоли прямо во время работы
+            margin = int(cfg.margin)
             found = track(
                 center_x - margin, center_y - margin, margin * 2, margin * 2,
                 offset_x=center_x - margin, offset_y=center_y - margin,
@@ -789,3 +1138,5 @@ except KeyboardInterrupt:
     print("\n[Стоп] Прервано с клавиатуры.")
 finally:
     grabber.stop()
+    if cfg.autosave and _config["data"] is not None and _config["autosave_ok"]:
+        profile_save(_config["active"])
