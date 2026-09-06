@@ -3,5 +3,7 @@ __pycache__/
 .venv/
 venv/
 
-# рабочий вывод скрипта
+# рабочий вывод скрипта и локальные настройки
 last.jpg
+aim_config.json
+aim_config.json.bak
