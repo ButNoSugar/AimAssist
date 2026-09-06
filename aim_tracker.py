@@ -1,6 +1,7 @@
 import ctypes
 import json
 import os
+import sys
 import threading
 import time
 
@@ -26,6 +27,30 @@ SECONDARY_COLOR = "#FFA500"
 CROP_PADDING = 15
 MAX_BLOBS_SHOWN = 24
 FAILSAFE_MARGIN = 2  # на столько пикселей держимся подальше от углов экрана (см. clamp_to_safe_area)
+
+IS_WINDOWS = sys.platform == "win32"
+
+
+def require_windows():
+    """Останавливает запуск на чужой ОС с внятным объяснением.
+
+    Раньше на Linux/macOS первым падал tk.Tk() внутри потока оверлея: в
+    консоль сыпался стектрейс, поток умирал, а главный поток навсегда вис на
+    _ready.wait(). Разобраться, что дело в платформе, по такой картине было
+    невозможно.
+    """
+    if IS_WINDOWS:
+        return
+    print(f"[Платформа] Скрипт рассчитан на Windows, а запущен на {sys.platform!r}.")
+    print("Что именно завязано на Windows:")
+    print("  - прозрачный клик-сквозной оверлей: ctypes.windll.user32 и")
+    print('    tkinter-атрибут "-transparentcolor" есть только в Windows;')
+    print("  - глобальные хоткеи keyboard (Ctrl/Alt/F6/F7): на Linux нужен root,")
+    print("    на macOS — разрешение на мониторинг ввода;")
+    print("  - определение времени загрузки для бенчмарка (GetTickCount64).")
+    print("Захват экрана (mss) и курсор (pyautogui) кроссплатформенны, так что")
+    print("портирование возможно, но это отдельная работа, а не пара правок.")
+    raise SystemExit(1)
 
 
 # ---------- Настройки, изменяемые на лету через консоль ----------
@@ -79,11 +104,23 @@ class Overlay:
         self._ready = threading.Event()
         self._shown_lock = threading.Lock()
         self._boxes_shown = False
+        self.error = None          # не None -> окно не поднялось, работаем без рамок
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
-        self._ready.wait()
+        if not self._ready.wait(timeout=10):
+            self.error = RuntimeError("окно оверлея не поднялось за 10 секунд")
 
     def _run(self):
+        try:
+            self._build_window()
+        except Exception as exc:      # noqa: BLE001 — причина уходит в self.error
+            self.error = exc
+            self._ready.set()         # иначе главный поток ждал бы вечно
+            return
+        self._ready.set()
+        self.root.mainloop()
+
+    def _build_window(self):
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -106,8 +143,6 @@ class Overlay:
 
         self.root.update_idletasks()
         self._make_click_through()
-        self._ready.set()
-        self.root.mainloop()
 
     def _make_click_through(self):
         hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
@@ -115,6 +150,8 @@ class Overlay:
         ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, styles | WS_EX_LAYERED | WS_EX_TRANSPARENT)
 
     def _run_synced(self, draw_fn):
+        if self.error is not None:
+            return
         done = threading.Event()
 
         def _job():
@@ -240,9 +277,16 @@ class FrameGrabber:
 
 
 # ---------- Инициализация ----------
+require_windows()
+
 screen_width, screen_height = pyautogui.size()
 center_x, center_y = screen_width // 2, screen_height // 2
 overlay = Overlay(screen_width, screen_height)
+if overlay.error is not None:
+    # само по себе не смертельно: быстрый режим рамок и не рисует
+    print(f"[Оверлей] Окно рамок не поднялось: {overlay.error}")
+    print("[Оверлей] Работаю без рамок. Настройка overlay/F7 включить его не сможет.")
+    cfg.overlay_enabled = False
 grabber = FrameGrabber(screen_width, screen_height)
 main_sct = mss.MSS()  # для синхронного режима (используется только из главного потока)
 
@@ -260,6 +304,9 @@ def reset_lock():
 
 def set_overlay_enabled(enabled):
     global _last_used_ts
+    if enabled and overlay.error is not None:
+        print(f"[Оверлей] Недоступен ({overlay.error}) — остаюсь в быстром режиме.")
+        enabled = False
     cfg.overlay_enabled = enabled
     if enabled:
         grabber.stop()
