@@ -1,3 +1,13 @@
+# Имя пакета для установки != имя модуля при импорте:
+#   Pillow                  -> import PIL
+#   opencv-python-headless  -> import cv2
+#   PyAutoGUI               -> import pyautogui
+# headless-сборка opencv легче и ставится стабильнее обычной opencv-python
+# (нам нужен только connectedComponentsWithStats/morphologyEx, GUI не нужен).
+
 PyAutoGUI~=0.9.54
 keyboard~=0.13.5
 numpy~=2.5.2
+mss>=9.0
+opencv-python-headless>=4.10
+Pillow>=10.0
