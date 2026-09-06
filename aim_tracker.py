@@ -77,6 +77,8 @@ class Overlay:
         self.max_rects = max_rects
         self.thickness = thickness
         self._ready = threading.Event()
+        self._shown_lock = threading.Lock()
+        self._boxes_shown = False
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         self._ready.wait()
@@ -124,7 +126,24 @@ class Overlay:
         self.root.after(0, _job)
         done.wait(timeout=0.2)
 
-    def hide_all_and_wait(self):
+    def hide_all_and_wait(self, force=False):
+        """Прячет все рамки. force=True — безусловно.
+
+        Главный цикл зовёт это каждые scan_interval, пока клавиша слежения не
+        нажата, то есть сотни раз в секунду вхолостую: каждый вызов ставил
+        задание в поток tkinter и ждал реальной перерисовки. Флаг убирает эту
+        работу, когда прятать нечего.
+
+        Но там, где скрытие обязательно — перед парой скриншотов в
+        track_synced и при смене режима — зовём с force=True: пропущенное
+        скрытие вернуло бы старый баг, когда рамка попадала в собственный
+        скриншот и разрасталась по кругу.
+        """
+        with self._shown_lock:
+            if not force and not self._boxes_shown:
+                return
+            self._boxes_shown = False
+
         def _hide():
             for rect_id in self.rect_ids:
                 self.canvas.coords(rect_id, -10, -10, -10, -10)
@@ -141,6 +160,8 @@ class Overlay:
                 else:
                     self.canvas.coords(rect_id, -10, -10, -10, -10)
         self._run_synced(_draw)
+        with self._shown_lock:
+            self._boxes_shown = bool(boxes)
 
 
 # ---------- Фоновый непрерывный захват экрана (используется когда оверлей выключен) ----------
@@ -151,13 +172,18 @@ class FrameGrabber:
     готовые кадры вместо того, чтобы блокирующе ждать новый скриншот —
     это и даёт основной прирост скорости в режиме без оверлея.
 
+    Снимает ровно ту область, которую просит режим слежения: в режиме Ctrl это
+    квадрат вокруг центра, а не весь экран. Полный кадр 1680x1050 — это 7 МБ,
+    которые копировались на каждом захвате только чтобы вырезать из них
+    середину.
+
     ВАЖНО: занимает одно ядро CPU практически полностью, пока запущен.
     Поэтому стартует только когда оверлей выключен, и останавливается,
     когда его включают обратно.
     """
 
     def __init__(self, width, height):
-        self.monitor = {"left": 0, "top": 0, "width": width, "height": height}
+        self.region = (0, 0, width, height)
         self.lock = threading.Lock()
         self.latest = None
         self.latest_ts = 0.0
@@ -175,20 +201,41 @@ class FrameGrabber:
     def stop(self):
         self._running = False
 
+    def set_region(self, region):
+        """Переключает снимаемую область. Кадры от прежней сразу выбрасываются."""
+        with self.lock:
+            if region == self.region:
+                return
+            self.region = region
+            self.latest = None
+            self.latest_ts = 0.0
+
     def _run(self):
         with mss.MSS() as sct:
             while self._running:
+                with self.lock:
+                    region = self.region
+                left, top, width, height = region
                 t0 = time.perf_counter()
-                shot = sct.grab(self.monitor)
+                shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
                 arr = np.array(shot, dtype=np.uint8)
                 t1 = time.perf_counter()
                 with self.lock:
+                    if self.region != region:
+                        continue          # область сменили, пока снимали — кадр уже не нужен
                     self.latest = arr
                     self.latest_ts = t1
                     self.capture_time_ms = (t1 - t0) * 1000
 
-    def get_latest(self):
+    def get_latest(self, region):
+        """Последний кадр, но только если он снят именно с этой области.
+
+        Без проверки кадр от прежней области ушёл бы в детектор вместе с
+        новыми смещениями, и курсор поехал бы не туда.
+        """
         with self.lock:
+            if self.region != region or self.latest is None:
+                return None, 0.0
             return self.latest, self.latest_ts
 
 
@@ -217,7 +264,7 @@ def set_overlay_enabled(enabled):
     if enabled:
         grabber.stop()
     else:
-        overlay.hide_all_and_wait()
+        overlay.hide_all_and_wait(force=True)
         _prev_holder["frame"] = None
         _last_used_ts = 0.0
         grabber.start()
@@ -397,7 +444,7 @@ def maybe_save_last_frame(arr_bgr, bbox, region_w, region_h):
 
 def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y):
     """Точный, но медленный режим: рамка синхронно прячется/показывается вокруг захвата."""
-    overlay.hide_all_and_wait()
+    overlay.hide_all_and_wait(force=True)
     time.sleep(cfg.hide_settle_delay)
 
     region = {"left": region_left, "top": region_top, "width": region_w, "height": region_h}
@@ -441,9 +488,11 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
     """Быстрый режим: без оверлея, кадры уже лежат готовые от фонового FrameGrabber."""
     global _last_used_ts
 
-    current, ts_now = grabber.get_latest()
+    region = (region_left, region_top, region_w, region_h)
+    grabber.set_region(region)                 # в режиме Ctrl снимаем только квадрат у центра
+    current, ts_now = grabber.get_latest(region)
     if current is None or ts_now == _last_used_ts:
-        return False  # фоновый поток ещё не успел снять новый кадр
+        return False  # фоновый поток ещё не успел снять новый кадр этой области
 
     prev = _prev_holder["frame"]
     _prev_holder["frame"] = current
@@ -451,10 +500,9 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
     if prev is None or prev.shape != current.shape:
         return False
 
+    # грабер отдал ровно нужную область — вырезать из кадра больше нечего
     t0 = time.perf_counter()
-    crop1 = prev[region_top:region_top + region_h, region_left:region_left + region_w, :]
-    crop2 = current[region_top:region_top + region_h, region_left:region_left + region_w, :]
-    blobs = find_blobs_arr(crop1, crop2, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
+    blobs = find_blobs_arr(prev, current, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
     t1 = time.perf_counter()
 
     if not blobs:
@@ -463,7 +511,7 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
     primary = select_target(blobs, offset_x, offset_y)
     local_cx, local_cy = primary["center"]
     screen_cx, screen_cy = offset_x + local_cx, offset_y + local_cy
-    maybe_save_last_frame(crop2, primary["bbox"], region_w, region_h)
+    maybe_save_last_frame(current, primary["bbox"], region_w, region_h)
     move_and_maybe_click(screen_cx, screen_cy)
     t2 = time.perf_counter()
 
