@@ -58,7 +58,7 @@ def require_windows():
 class Config:
     def __init__(self):
         self.aim_mode = "auto"          # auto | absolute | relative (см. move_and_maybe_click)
-        self.window_title = "Minecraft"  # подстрока заголовка окна игры (пусто = не привязываться)
+        self.window_title = "Minecraft"  # ключевое слово в заголовке окна игры (пусто = не привязываться)
         self.camera_gain = 0.5          # доля ошибки, проходимая за кадр в относительном режиме
         self.margin = 100               # отступ от центра до края области слежения (режим Ctrl), px
         self.scan_interval = 0.005      # пауза между итерациями главного цикла (сек)
@@ -74,6 +74,7 @@ class Config:
         self.debug_log = True           # печатать таймлоги каждой детекции
         self.save_last_frame = False    # сохранять last.jpg (лишняя запись на диск = задержка)
         self.auto_click = False
+        self.click_interval = 0.0       # минимальная пауза между автокликами, сек (0 = каждую детекцию)
         self.overlay_enabled = True     # True = точный, но медленный синхронный режим
                                          # False = быстрый режим с фоновым захватом экрана
         self.autosave = True            # сохранять активный профиль при выходе
@@ -141,18 +142,37 @@ def send_relative_mouse_move(dx, dy):
     return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) == 1
 
 
-def foreground_window_title():
-    """(hwnd, заголовок) активного окна."""
+def window_text(hwnd):
     user32 = ctypes.windll.user32
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
-        return 0, ""
     length = user32.GetWindowTextLengthW(hwnd)
     if length <= 0:
-        return hwnd, ""
+        return ""
     buffer = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, buffer, length + 1)
-    return hwnd, buffer.value
+    return buffer.value
+
+
+TITLE_CACHE_TTL = 0.5
+_window_cache = {"hwnd": 0, "title": "", "ts": 0.0}
+
+
+def foreground_window_title():
+    """(hwnd, заголовок) активного окна, с кэшем на заголовок.
+
+    GetWindowTextW шлёт окну WM_GETTEXT, то есть синхронно лезет в чужой
+    процесс и ждёт, пока тот разберёт очередь сообщений. В цикле наведения,
+    который крутится сотни раз в секунду, занятая игра могла бы задержать
+    такой вызов на целый кадр. Сам hwnd берём каждый раз — он дешёвый и
+    сразу показывает переключение окна; заголовок перечитываем только когда
+    окно сменилось или прошло TITLE_CACHE_TTL.
+    """
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    now = time.perf_counter()
+    if hwnd != _window_cache["hwnd"] or now - _window_cache["ts"] > TITLE_CACHE_TTL:
+        _window_cache["hwnd"] = hwnd
+        _window_cache["title"] = window_text(hwnd) if hwnd else ""
+        _window_cache["ts"] = now
+    return hwnd, _window_cache["title"]
 
 
 def client_rect_on_screen(hwnd):
@@ -207,7 +227,7 @@ def update_aim_context():
     Возвращает область игры или None (обычный рабочий стол).
     """
     viewport = None
-    needle = cfg.window_title.strip().lower()
+    needle = cfg.window_title.strip().lower()   # ключевое слово, а не весь заголовок
     if needle:
         hwnd, title = foreground_window_title()
         if hwnd and needle in title.lower():
@@ -666,13 +686,32 @@ def move_relative_to_target(x, y):
     send_relative_mouse_move(dx, dy)
 
 
+_last_click = {"ts": 0.0}
+
+
+def click_is_due():
+    """Пора ли кликать с учётом click_interval.
+
+    Детекция идёт сотнями раз в секунду, и автоклик без паузы столько же раз
+    и жал. В игре это почти всегда вхолостую: у атаки своя перезарядка, и
+    лишние нажатия ничего не добавляют.
+    """
+    if cfg.click_interval <= 0:
+        return True
+    now = time.perf_counter()
+    if now - _last_click["ts"] < cfg.click_interval:
+        return False
+    _last_click["ts"] = now
+    return True
+
+
 def move_and_maybe_click(x, y):
     """Наводит на цель (x, y) в экранных координатах и, если включено, кликает."""
     if _aim["relative"]:
         move_relative_to_target(x, y)
     else:
         move_absolute_to_target(x, y)
-    if cfg.auto_click:
+    if cfg.auto_click and click_is_due():
         pyautogui.click()
 
 
@@ -886,6 +925,7 @@ MIN_VALUES = {
     "dead_zone": 0,
     "margin": 1,
     "camera_gain": 0.01,
+    "click_interval": 0.0,
 }
 
 # значения-строки: что вообще можно вписать
@@ -983,7 +1023,7 @@ SETTINGS_GROUPS = [
     )),
     ("Прицел в игре", (
         ("aim_mode",          "auto = относительное движение, когда активно окно игры, иначе абсолютное"),
-        ("window_title",      "подстрока заголовка окна игры; пусто — не привязываться к окну"),
+        ("window_title",      "ключевое слово в заголовке окна игры; пусто — не привязываться к окну"),
         ("camera_gain",       "доля ошибки за кадр в относительном режиме: больше — резче, но с перелётом"),
     )),
     ("Прицел на рабочем столе", (
@@ -1000,6 +1040,7 @@ SETTINGS_GROUPS = [
     ("Режимы и вывод", (
         ("overlay_enabled",   "рамка оверлея: on = точнее и медленнее, off = быстрый режим (F7)"),
         ("auto_click",        "кликать после наведения (F6)"),
+        ("click_interval",    "минимальная пауза между кликами, сек: 0 = на каждой детекции"),
         ("debug_log",         "печатать таймлог каждой детекции"),
         ("save_last_frame",   "сохранять last.jpg при детекции — запись на диск добавляет задержку"),
         ("autosave",          "сохранять активный профиль при выходе"),
@@ -1086,7 +1127,7 @@ def print_window_info():
 
     needle = cfg.window_title.strip()
     matched = bool(needle) and needle.lower() in title.lower()
-    print(f"\n  Ищем подстроку:  {needle!r}")
+    print(f"\n  Ключевое слово:  {needle!r}")
     print(f"  Активно сейчас:  {title!r}  ->  {'совпадает' if matched else 'не совпадает'}")
 
     last = _aim["last_match"]
