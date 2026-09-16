@@ -21,6 +21,7 @@ TRACK_KEY = "ctrl"
 FULLSCREEN_KEY = "alt"
 AUTOCLICK_TOGGLE_KEY = "f6"
 OVERLAY_TOGGLE_KEY = "f7"
+PANIC_KEY = "f8"
 
 PRIMARY_COLOR = "#00FF00"
 SECONDARY_COLOR = "#FFA500"
@@ -56,6 +57,9 @@ def require_windows():
 # ---------- Настройки, изменяемые на лету через консоль ----------
 class Config:
     def __init__(self):
+        self.aim_mode = "auto"          # auto | absolute | relative (см. move_and_maybe_click)
+        self.window_title = "Minecraft"  # ключевое слово в заголовке окна игры (пусто = не привязываться)
+        self.camera_gain = 0.5          # доля ошибки, проходимая за кадр в относительном режиме
         self.margin = 100               # отступ от центра до края области слежения (режим Ctrl), px
         self.scan_interval = 0.005      # пауза между итерациями главного цикла (сек)
         self.diff_threshold = 30        # порог чувствительности разницы пикселей (0-255)
@@ -70,6 +74,7 @@ class Config:
         self.debug_log = True           # печатать таймлоги каждой детекции
         self.save_last_frame = False    # сохранять last.jpg (лишняя запись на диск = задержка)
         self.auto_click = False
+        self.click_interval = 0.0       # минимальная пауза между автокликами, сек (0 = каждую детекцию)
         self.overlay_enabled = True     # True = точный, но медленный синхронный режим
                                          # False = быстрый режим с фоновым захватом экрана
         self.autosave = True            # сохранять активный профиль при выходе
@@ -77,6 +82,168 @@ class Config:
 
 
 cfg = Config()
+
+
+# ---------- Win32: относительный ввод мыши и привязка к окну игры ----------
+# Зачем это нужно: pyautogui двигает курсор через SetCursorPos, а это просто
+# запись позиции — она не проходит через очередь ввода, и игра, читающая
+# raw input (Minecraft в их числе), её вообще не видит. Клик у pyautogui идёт
+# через mouse_event, то есть настоящую инъекцию ввода, и до игры доходит.
+# Отсюда и симптом: персонаж бьёт по воздуху, а камера стоит на месте.
+# SendInput с MOUSEEVENTF_MOVE без флага ABSOLUTE — тоже инъекция, и приходит
+# как относительное смещение, которого игра с захваченным курсором и ждёт.
+
+ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long), ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong), ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("union", _INPUTUNION)]
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+_sendinput_ready = [False]
+
+
+def send_relative_mouse_move(dx, dy):
+    """Сдвигает мышь на (dx, dy) отсчётов через SendInput."""
+    if dx == 0 and dy == 0:
+        return True
+    user32 = ctypes.windll.user32
+    if not _sendinput_ready[0]:
+        # без argtypes на 64-битной Python указатель ужался бы до int
+        user32.SendInput.argtypes = (ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int)
+        user32.SendInput.restype = ctypes.c_uint
+        _sendinput_ready[0] = True
+    event = INPUT(type=INPUT_MOUSE)
+    event.union.mi = MOUSEINPUT(dx=int(dx), dy=int(dy), mouseData=0,
+                                dwFlags=MOUSEEVENTF_MOVE, time=0, dwExtraInfo=0)
+    return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) == 1
+
+
+def window_text(hwnd):
+    user32 = ctypes.windll.user32
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buffer, length + 1)
+    return buffer.value
+
+
+TITLE_CACHE_TTL = 0.5
+_window_cache = {"hwnd": 0, "title": "", "ts": 0.0}
+
+
+def foreground_window_title():
+    """(hwnd, заголовок) активного окна, с кэшем на заголовок.
+
+    GetWindowTextW шлёт окну WM_GETTEXT, то есть синхронно лезет в чужой
+    процесс и ждёт, пока тот разберёт очередь сообщений. В цикле наведения,
+    который крутится сотни раз в секунду, занятая игра могла бы задержать
+    такой вызов на целый кадр. Сам hwnd берём каждый раз — он дешёвый и
+    сразу показывает переключение окна; заголовок перечитываем только когда
+    окно сменилось или прошло TITLE_CACHE_TTL.
+    """
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    now = time.perf_counter()
+    if hwnd != _window_cache["hwnd"] or now - _window_cache["ts"] > TITLE_CACHE_TTL:
+        _window_cache["hwnd"] = hwnd
+        _window_cache["title"] = window_text(hwnd) if hwnd else ""
+        _window_cache["ts"] = now
+    return hwnd, _window_cache["title"]
+
+
+def client_rect_on_screen(hwnd):
+    """Клиентская область окна в экранных координатах: (left, top, w, h) или None.
+
+    Именно клиентская, а не рамка окна: в неё не входят заголовок и границы,
+    то есть это ровно тот прямоугольник, который игра рисует. Его центр и
+    есть прицел — в оконном режиме он не совпадает с центром экрана.
+    """
+    user32 = ctypes.windll.user32
+    rect = RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
+    origin = POINT(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+        return None
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        return None
+    return (origin.x, origin.y, width, height)
+
+
+def clamp_region(left, top, width, height):
+    """Прижимает область к экрану: mss не умеет снимать за его границами.
+
+    Нужно с тех пор, как область слежения привязана к окну: окно у края
+    экрана легко даёт прицел, вокруг которого квадрат margin вылезает наружу.
+    """
+    left = max(0, min(int(left), screen_width - 1))
+    top = max(0, min(int(top), screen_height - 1))
+    width = max(1, min(int(width), screen_width - left))
+    height = max(1, min(int(height), screen_height - top))
+    return left, top, width, height
+
+
+# Обновляется раз за итерацию главного цикла, читается наводкой и логами.
+_aim = {
+    "crosshair": (0, 0),
+    "relative": False,
+    "last_delta": (0, 0),
+    "last_match": None,     # (заголовок, область) последнего найденного окна игры
+}
+
+
+def update_aim_context():
+    """Определяет точку прицела и способ движения на эту итерацию.
+
+    Окно ищем только среди активных: целиться в неактивную игру бессмысленно,
+    а перебор всех окон давал бы ложные совпадения — браузер со словом
+    Minecraft в заголовке, папка с таким же именем.
+
+    Возвращает область игры или None (обычный рабочий стол).
+    """
+    viewport = None
+    needle = cfg.window_title.strip().lower()   # ключевое слово, а не весь заголовок
+    if needle:
+        hwnd, title = foreground_window_title()
+        if hwnd and needle in title.lower():
+            viewport = client_rect_on_screen(hwnd)
+            if viewport is not None:
+                _aim["last_match"] = (title, viewport)
+
+    if viewport is None:
+        _aim["crosshair"] = (center_x, center_y)
+        _aim["relative"] = cfg.aim_mode == "relative"
+    else:
+        left, top, width, height = viewport
+        _aim["crosshair"] = (left + width // 2, top + height // 2)
+        _aim["relative"] = cfg.aim_mode in ("auto", "relative")
+    return viewport
+
 
 
 # ---------- Оверлей (используется только когда cfg.overlay_enabled=True) ----------
@@ -290,6 +457,7 @@ if overlay.error is not None:
 grabber = FrameGrabber(screen_width, screen_height)
 main_sct = mss.MSS()  # для синхронного режима (используется только из главного потока)
 
+_stop = threading.Event()
 _prev_holder = {"frame": None}
 _last_used_ts = 0.0
 
@@ -324,7 +492,18 @@ def toggle_autoclick():
     print(f"[Автоклик] {'включен' if cfg.auto_click else 'выключен'}")
 
 
+def panic_stop():
+    """Аварийная остановка.
+
+    В относительном режиме курсор по экрану не ездит, поэтому угловой failsafe
+    у pyautogui там не сработает — эта клавиша его заменяет.
+    """
+    _stop.set()
+    print(f"\n[Стоп] Аварийная остановка по {PANIC_KEY.upper()}.")
+
+
 keyboard.add_hotkey(AUTOCLICK_TOGGLE_KEY, toggle_autoclick)
+keyboard.add_hotkey(PANIC_KEY, panic_stop)
 keyboard.add_hotkey(OVERLAY_TOGGLE_KEY, lambda: set_overlay_enabled(not cfg.overlay_enabled))
 
 def ask_margin():
@@ -449,24 +628,23 @@ def select_target(blobs, offset_x, offset_y):
     return primary
 
 
-def move_and_maybe_click(x, y):
-    """Ведёт курсор к цели (x, y) в экранных координатах.
+_move_remainder = {"x": 0.0, "y": 0.0}
+
+
+def move_absolute_to_target(x, y):
+    """Ставит курсор в точку экрана — прежний способ, для рабочего стола.
 
     move_smoothing < 1.0 — экспоненциальное сглаживание: за кадр проходим
-    только эту долю пути до цели. Поскольку цикл слежения крутится непрерывно,
-    курсор подъезжает к цели за несколько кадров вместо телепорта — движение
-    получается похожим на человеческое. dead_zone гасит микродёрганье на
-    один-два пикселя.
+    только эту долю пути до цели, и курсор подъезжает за несколько кадров
+    вместо телепорта. dead_zone гасит микродёрганье на один-два пикселя.
 
-    Оба выключены по умолчанию (1.0 и 0), потому что включённая мёртвая зона
-    добавляет в горячий путь вызов pyautogui.position().
+    В игре, захватившей курсор, этот способ не работает: SetCursorPos до неё
+    не доходит (см. send_relative_mouse_move).
     """
     if cfg.move_smoothing < 1.0 or cfg.dead_zone > 0:
         cur_x, cur_y = pyautogui.position()
         dx, dy = x - cur_x, y - cur_y
         if dx * dx + dy * dy <= cfg.dead_zone * cfg.dead_zone:
-            if cfg.auto_click:
-                pyautogui.click()
             return
         if cfg.move_smoothing < 1.0:
             x = cur_x + dx * cfg.move_smoothing
@@ -474,8 +652,74 @@ def move_and_maybe_click(x, y):
 
     x, y = clamp_to_safe_area(x, y)
     pyautogui.moveTo(x, y, duration=cfg.move_duration)
-    if cfg.auto_click:
+
+
+def move_relative_to_target(x, y):
+    """Доворачивает камеру к цели относительным смещением мыши.
+
+    Игра не сообщает, куда смотрит камера, поэтому это замкнутый контур: за
+    кадр сдвигаем мышь на долю ошибки, снимаем экран заново и повторяем, пока
+    цель не придёт в прицел. Благодаря этому точная калибровка не нужна —
+    достаточно camera_gain меньше единицы, и контур сойдётся сам. Слишком
+    большой gain даёт перелёт и раскачку.
+
+    Пиксели ошибки и "отсчёты" мыши — разные величины: коэффициент между ними
+    зависит от чувствительности и FOV в игре, и подбирается как раз
+    camera_gain.
+    """
+    cross_x, cross_y = _aim["crosshair"]
+    error_x, error_y = x - cross_x, y - cross_y
+    if error_x * error_x + error_y * error_y <= cfg.dead_zone * cfg.dead_zone:
+        _move_remainder["x"] = _move_remainder["y"] = 0.0
+        _aim["last_delta"] = (0, 0)
+        return
+
+    # SendInput принимает только целые отсчёты, а дробный остаток копим между
+    # кадрами: иначе при небольшой ошибке и gain<1 смещение каждый раз
+    # округлялось бы в ноль, и наводка замирала бы, чуть не дойдя до цели.
+    step_x = error_x * cfg.camera_gain + _move_remainder["x"]
+    step_y = error_y * cfg.camera_gain + _move_remainder["y"]
+    dx, dy = int(step_x), int(step_y)
+    _move_remainder["x"] = step_x - dx
+    _move_remainder["y"] = step_y - dy
+    _aim["last_delta"] = (dx, dy)
+    send_relative_mouse_move(dx, dy)
+
+
+_last_click = {"ts": 0.0}
+
+
+def click_is_due():
+    """Пора ли кликать с учётом click_interval.
+
+    Детекция идёт сотнями раз в секунду, и автоклик без паузы столько же раз
+    и жал. В игре это почти всегда вхолостую: у атаки своя перезарядка, и
+    лишние нажатия ничего не добавляют.
+    """
+    if cfg.click_interval <= 0:
+        return True
+    now = time.perf_counter()
+    if now - _last_click["ts"] < cfg.click_interval:
+        return False
+    _last_click["ts"] = now
+    return True
+
+
+def move_and_maybe_click(x, y):
+    """Наводит на цель (x, y) в экранных координатах и, если включено, кликает."""
+    if _aim["relative"]:
+        move_relative_to_target(x, y)
+    else:
+        move_absolute_to_target(x, y)
+    if cfg.auto_click and click_is_due():
         pyautogui.click()
+
+
+def aim_log_suffix():
+    if not _aim["relative"]:
+        return ""
+    dx, dy = _aim["last_delta"]
+    return f" | SendInput dx={dx} dy={dy}"
 
 
 def maybe_save_last_frame(arr_bgr, bbox, region_w, region_h):
@@ -526,7 +770,7 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
             f"area={primary['area']}px -> ({screen_cx},{screen_cy}) | "
             f"захват={((t1 - t0) * 1000):.1f}мс diff={((t2 - t1) * 1000):.1f}мс "
             f"оверлей={((t3 - t2) * 1000):.1f}мс move={((t4 - t3) * 1000):.1f}мс "
-            f"| итого={((t4 - t0) * 1000):.1f}мс"
+            f"| итого={((t4 - t0) * 1000):.1f}мс" + aim_log_suffix()
         )
     return True
 
@@ -567,7 +811,7 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
             f"[fast] пятен={len(blobs)}{' [lock]' if _lock['held'] else ''} "
             f"area={primary['area']}px -> ({screen_cx},{screen_cy}) | "
             f"diff={((t1 - t0) * 1000):.1f}мс move={((t2 - t1) * 1000):.1f}мс "
-            f"| захват фоном ~{grabber.capture_time_ms:.1f}мс/кадр"
+            f"| захват фоном ~{grabber.capture_time_ms:.1f}мс/кадр" + aim_log_suffix()
         )
     return True
 
@@ -655,6 +899,7 @@ def print_help():
         "  overlay on|off               — вкл/выкл рамку (F7 делает то же самое)\n"
         "  click on|off                 — вкл/выкл автоклик (F6 делает то же самое)\n"
         "  save on|off                  — сохранять last.jpg при детекции (тратит время!)\n"
+        "  window                       — к какому окну привязан прицел и как двигаем мышь\n"
         "  bench                        — замерить скорость захвата/детекции сейчас\n"
         "  profiles                     — страница профилей: список и команды\n"
         "  profile save|load|delete|default|defaults\n"
@@ -679,12 +924,20 @@ MIN_VALUES = {
     "move_smoothing": 0.01,   # 0 полностью заморозило бы курсор
     "dead_zone": 0,
     "margin": 1,
+    "camera_gain": 0.01,
+    "click_interval": 0.0,
+}
+
+# значения-строки: что вообще можно вписать
+ALLOWED_VALUES = {
+    "aim_mode": ("auto", "absolute", "relative"),
 }
 
 # верхние границы (нужны только там, где значение — доля)
 MAX_VALUES = {
     "move_smoothing": 1.0,
     "margin": min(center_x, center_y),   # больше — область слежения вылезет за край экрана
+    "camera_gain": 5.0,
 }
 
 
@@ -708,6 +961,14 @@ def coerce_setting(name, raw):
     current = getattr(cfg, name)
     if isinstance(current, bool):          # bool наследуется от int — проверяем его первым
         return parse_bool(raw) if isinstance(raw, str) else bool(raw)
+    if isinstance(current, str):
+        value = str(raw).strip()
+        allowed = ALLOWED_VALUES.get(name)
+        if allowed is None:
+            return value                   # свободный текст, например заголовок окна
+        if value.lower() not in allowed:
+            raise ValueError(f"допустимо: {', '.join(allowed)}")
+        return value.lower()
     if isinstance(current, int):
         return int(float(raw))
     return float(raw)
@@ -760,7 +1021,12 @@ SETTINGS_GROUPS = [
         ("min_blob_area",     "минимальная площадь пятна, px: всё мельче отбрасывается"),
         ("denoise_kernel",    "ядро фильтра точечного шума перед поиском пятен, px (0 = выкл)"),
     )),
-    ("Прицел", (
+    ("Прицел в игре", (
+        ("aim_mode",          "auto = относительное движение, когда активно окно игры, иначе абсолютное"),
+        ("window_title",      "ключевое слово в заголовке окна игры; пусто — не привязываться к окну"),
+        ("camera_gain",       "доля ошибки за кадр в относительном режиме: больше — резче, но с перелётом"),
+    )),
+    ("Прицел на рабочем столе", (
         ("lock_radius",       "радиус залипания на прежнюю цель, px (0 = выкл, всегда крупнейшее пятно)"),
         ("lock_timeout",      "через сколько секунд без детекций прежняя цель забывается"),
         ("move_smoothing",    "доля пути до цели за кадр: 1.0 = мгновенно, 0.3 = плавно для записи"),
@@ -774,6 +1040,7 @@ SETTINGS_GROUPS = [
     ("Режимы и вывод", (
         ("overlay_enabled",   "рамка оверлея: on = точнее и медленнее, off = быстрый режим (F7)"),
         ("auto_click",        "кликать после наведения (F6)"),
+        ("click_interval",    "минимальная пауза между кликами, сек: 0 = на каждой детекции"),
         ("debug_log",         "печатать таймлог каждой детекции"),
         ("save_last_frame",   "сохранять last.jpg при детекции — запись на диск добавляет задержку"),
         ("autosave",          "сохранять активный профиль при выходе"),
@@ -798,6 +1065,9 @@ def settings_groups_full():
 def range_hint(name, value):
     if isinstance(value, bool):
         return "on/off"
+    if isinstance(value, str):
+        allowed = ALLOWED_VALUES.get(name)
+        return "|".join(allowed) if allowed else "текст"
     low, high = MIN_VALUES.get(name), MAX_VALUES.get(name)
     if low is None and high is None:
         return ""
@@ -811,6 +1081,8 @@ def format_value(value):
         return "on"
     if value is False:
         return "off"
+    if isinstance(value, str):
+        return repr(value)                 # видно пробелы и пустую строку
     return str(value)
 
 
@@ -823,7 +1095,7 @@ def print_settings_menu():
             value = getattr(cfg, name)
             hint = range_hint(name, value)
             hint = f"[{hint}]" if hint else ""
-            print(f"    {name:<18}= {format_value(value):<7} {hint:<11} {desc}")
+            print(f"    {name:<18}= {format_value(value):<13} {hint:<22} {desc}")
         print()
 
 
@@ -838,6 +1110,39 @@ def describe_setting(name):
     if desc:
         print(f"    {desc}")
     print(f"    изменить: set {name} <значение>")
+
+
+def print_window_info():
+    """Диагностика привязки к окну: без неё непонятно, почему не наводится.
+
+    Показывает и активное сейчас окно, и последнее совпавшее: пока ты набираешь
+    команду в консоли, активна именно консоль, так что первое почти всегда
+    будет "не совпадает" — смотреть надо на второе.
+    """
+    try:
+        hwnd, title = foreground_window_title()
+    except Exception as exc:               # noqa: BLE001 — диагностике падать незачем
+        print(f"[Окно] Не удалось опросить активное окно: {exc}")
+        return
+
+    needle = cfg.window_title.strip()
+    matched = bool(needle) and needle.lower() in title.lower()
+    print(f"\n  Ключевое слово:  {needle!r}")
+    print(f"  Активно сейчас:  {title!r}  ->  {'совпадает' if matched else 'не совпадает'}")
+
+    last = _aim["last_match"]
+    if last is None:
+        print("  Окно игры ещё ни разу не попадалось.")
+        print(f"  Прицел: центр экрана ({center_x}, {center_y}).")
+    else:
+        last_title, (left, top, width, height) = last
+        print(f"  Последнее совпавшее: {last_title!r}")
+        print(f"    клиентская область {width}x{height} в точке ({left}, {top})")
+        print(f"    прицел ({left + width // 2}, {top + height // 2})")
+
+    way = "относительное (SendInput)" if _aim["relative"] else "абсолютное (SetCursorPos)"
+    print(f"  aim_mode={cfg.aim_mode} -> сейчас движение {way}")
+    print("  Абсолютное движение игра с raw input не увидит.\n")
 
 
 def print_settings():
@@ -1174,6 +1479,8 @@ def console_loop():
                 run_benchmark()
             elif cmd == "edit":
                 print_settings_menu()
+            elif cmd == "window":
+                print_window_info()
             elif cmd == "profiles":
                 print_profiles_page()
             elif cmd == "profile":
@@ -1186,7 +1493,8 @@ def console_loop():
                 elif len(parts) == 2:
                     describe_setting(parts[1])          # без значения — показываем текущее и описание
                 else:
-                    apply_setting(parts[1], parts[2])
+                    # значение склеиваем: в заголовке окна бывают пробелы
+                    apply_setting(parts[1], " ".join(parts[2:]))
             else:
                 print("Неизвестная команда. Введи 'help'.")
         except (IndexError, ValueError):
@@ -1205,21 +1513,33 @@ print("\nЗажми Ctrl — слежение в области у центра 
 print("Зажми Alt — слежение по всему экрану.")
 print(f"{AUTOCLICK_TOGGLE_KEY.upper()} / 'click on|off' — автоклик.")
 print(f"{OVERLAY_TOGGLE_KEY.upper()} / 'overlay on|off' — рамка оверлея (выключи для максимальной скорости).")
+print(f"{PANIC_KEY.upper()} — аварийная остановка (в игре угловой failsafe не сработает).")
 print("Для плавного движения на записи: 'set move_smoothing 0.3' и 'set dead_zone 2'.")
+print("В игре наводка идёт относительными смещениями; 'window' покажет привязку,")
+print("'set camera_gain 0.3' — если камеру перебрасывает через цель.")
 print("'edit' — все настройки, 'profiles' — профили. Отступ Ctrl меняется на лету: 'set margin 150'.")
 
 try:
-    while True:
+    while not _stop.is_set():
         found = False
+        # прицел и способ движения пересчитываем каждую итерацию: окно игры
+        # можно свернуть, подвинуть или переключиться из него в другое
+        viewport = update_aim_context()
+
         if keyboard.is_pressed(TRACK_KEY):
             # снимок на итерацию: margin правится из консоли прямо во время работы
             margin = int(cfg.margin)
-            found = track(
-                center_x - margin, center_y - margin, margin * 2, margin * 2,
-                offset_x=center_x - margin, offset_y=center_y - margin,
-            )
+            cross_x, cross_y = _aim["crosshair"]
+            left, top, width, height = clamp_region(
+                cross_x - margin, cross_y - margin, margin * 2, margin * 2)
+            found = track(left, top, width, height, offset_x=left, offset_y=top)
         elif keyboard.is_pressed(FULLSCREEN_KEY):
-            found = track(0, 0, screen_width, screen_height, offset_x=0, offset_y=0)
+            # когда игра идёт в окне, незачем разглядывать остальной рабочий стол
+            if viewport is None:
+                left, top, width, height = 0, 0, screen_width, screen_height
+            else:
+                left, top, width, height = clamp_region(*viewport)
+            found = track(left, top, width, height, offset_x=left, offset_y=top)
 
         if not found and cfg.overlay_enabled:
             overlay.hide_all_and_wait()
