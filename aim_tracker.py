@@ -1,10 +1,129 @@
+import atexit
 import ctypes
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
+import traceback
 
+# ---------- Запуск без IDE ----------
+# PyCharm запускает скрипт интерпретатором из venv, а двойной клик по файлу или
+# `python aim_tracker.py` — системным, в котором модулей нет. Отсюда и выходило,
+# что без IDE ничего не стартует. Скрипт сам находит venv рядом с собой и, если
+# модулей не видно, передаёт себя его интерпретатору. Модули при этом должны
+# быть уже установлены — просто находиться они будут сами.
+
+BOOTSTRAP_MARKER = "AIMTRACKER_BOOTSTRAPPED"   # защита от бесконечного перезапуска
+LAUNCHER_MARKER = "AIMTRACKER_LAUNCHER"        # выставляет run.bat, у него своя пауза
+PYTHON_OVERRIDE = "AIMTRACKER_PYTHON"          # путь к интерпретатору вручную
+VENV_DIRS = (".venv", "venv", "env", ".env")
+
+SCRIPT_PATH = os.path.abspath(__file__)
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+
+_console_held = [False]
+
+
+def hold_console(message="\nНажми Enter, чтобы закрыть окно..."):
+    """Не даёт окну консоли закрыться, пока не нажмёшь Enter.
+
+    Без этого двойной клик по файлу с ошибкой на старте выглядел так: окно
+    мигнуло и исчезло, прочитать стектрейс невозможно.
+
+    Из run.bat не спрашиваем — там своя pause, иначе Enter пришлось бы жать
+    дважды. И не спрашиваем, когда консоли нет (запуск из теста, перенаправленный
+    ввод): там ждать нажатия было бы вечным зависанием.
+    """
+    if _console_held[0] or os.environ.get(LAUNCHER_MARKER):
+        return
+    _console_held[0] = True
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return
+        input(message)
+    except (EOFError, KeyboardInterrupt, OSError, ValueError):
+        pass
+
+
+def _report_unhandled(exc_type, exc, tb):
+    traceback.print_exception(exc_type, exc, tb)
+    print("\n[Ошибка] Скрипт остановился из-за ошибки выше.")
+    hold_console()
+
+
+def dependencies_present():
+    try:
+        import cv2, keyboard, mss, numpy, pyautogui  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def find_venv_python():
+    """Интерпретатор из venv рядом со скриптом, или заданный переменной среды."""
+    override = os.environ.get(PYTHON_OVERRIDE, "").strip().strip('"')
+    if override:
+        return override if os.path.isfile(override) else None
+    if os.name == "nt":
+        parts = ("Scripts", "python.exe")       # pythonw.exe не берём: он без консоли
+    else:
+        parts = ("bin", "python3")
+    for folder in VENV_DIRS:
+        candidate = os.path.join(SCRIPT_DIR, folder, *parts)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def explain_missing_dependencies():
+    print("[Запуск] Не хватает модулей, и venv рядом со скриптом не найден.")
+    print(f"         Скрипт лежит в: {SCRIPT_DIR}")
+    print(f"         Текущий питон:  {sys.executable}")
+    print("\n  Создать окружение и поставить модули (один раз, в этой папке):")
+    if os.name == "nt":
+        print("    py -m venv .venv")
+        print("    .venv\\Scripts\\python -m pip install -r requirements.txt")
+        print("\n  Дальше запускать run.bat — он сам найдёт .venv.")
+    else:
+        print("    python3 -m venv .venv")
+        print("    .venv/bin/python -m pip install -r requirements.txt")
+    print("\n  Если venv уже есть в другом месте, укажи путь к его питону:")
+    print(f"    set {PYTHON_OVERRIDE}=C:\\путь\\к\\venv\\Scripts\\python.exe")
+
+
+def bootstrap_dependencies():
+    """Перезапускает скрипт питоном из venv, если в текущем модулей нет."""
+    if dependencies_present():
+        return
+    if os.environ.get(BOOTSTRAP_MARKER):
+        # уже перезапускались — значит и в venv модулей нет, второй круг не поможет
+        print("[Запуск] Даже в venv не хватает модулей.")
+        explain_missing_dependencies()
+        hold_console()
+        raise SystemExit(1)
+
+    interpreter = find_venv_python()
+    if interpreter is None:
+        explain_missing_dependencies()
+        hold_console()
+        raise SystemExit(1)
+
+    print(f"[Запуск] В этом питоне модулей нет, перезапускаюсь через:\n         {interpreter}")
+    environment = dict(os.environ, **{BOOTSTRAP_MARKER: "1"})
+    # subprocess, а не os.execv: на Windows execv отпускает родителя сразу, и
+    # консоль (вместе с pause в run.bat) успевала закрыться под живым процессом
+    completed = subprocess.run([interpreter, SCRIPT_PATH] + sys.argv[1:], env=environment)
+    raise SystemExit(completed.returncode)
+
+
+sys.excepthook = _report_unhandled
+atexit.register(hold_console)
+bootstrap_dependencies()
+
+# Импорты модулей — после бутстрапа: до него их может просто не быть видно.
 import cv2
 import keyboard
 import mss
@@ -79,6 +198,7 @@ class Config:
                                          # False = быстрый режим с фоновым захватом экрана
         self.autosave = True            # сохранять активный профиль при выходе
         self.bench_on_boot = True       # прогонять бенчмарк один раз за загрузку компьютера
+        self.pause_on_start = False      # ждать Enter после вывода настроек, перед слежением
 
 
 cfg = Config()
@@ -1045,6 +1165,7 @@ SETTINGS_GROUPS = [
         ("save_last_frame",   "сохранять last.jpg при детекции — запись на диск добавляет задержку"),
         ("autosave",          "сохранять активный профиль при выходе"),
         ("bench_on_boot",     "гонять бенчмарк один раз за загрузку компьютера, а не каждый старт"),
+        ("pause_on_start",    "ждать Enter перед началом слежения, чтобы успеть прочитать вывод"),
     )),
 ]
 
@@ -1507,6 +1628,14 @@ set_overlay_enabled(cfg.overlay_enabled)  # запускает грабер, е�
 # reset_config) успевала отработать в середине замера, а завершавшийся
 # следом бенчмарк своим save_config_file() воскрешал только что удалённый файл.
 maybe_run_startup_benchmark()
+
+if cfg.pause_on_start:
+    # до старта консольного потока: иначе он перехватил бы этот же Enter
+    try:
+        input("\n[Пауза] Enter — начать слежение ('set pause_on_start off' уберёт паузу)...")
+    except EOFError:
+        pass
+
 threading.Thread(target=console_loop, daemon=True).start()
 
 print("\nЗажми Ctrl — слежение в области у центра экрана.")
@@ -1518,6 +1647,7 @@ print("Для плавного движения на записи: 'set move_smo
 print("В игре наводка идёт относительными смещениями; 'window' покажет привязку,")
 print("'set camera_gain 0.3' — если камеру перебрасывает через цель.")
 print("'edit' — все настройки, 'profiles' — профили. Отступ Ctrl меняется на лету: 'set margin 150'.")
+print("Окно не должно закрываться само: при ошибке скрипт покажет её и дождётся Enter.")
 
 try:
     while not _stop.is_set():
