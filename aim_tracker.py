@@ -1,10 +1,132 @@
+import atexit
 import ctypes
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import textwrap
 import threading
 import time
+import traceback
 
+# ---------- Запуск без IDE ----------
+# PyCharm запускает скрипт интерпретатором из venv, а двойной клик по файлу или
+# `python aim_tracker.py` — системным, в котором модулей нет. Отсюда и выходило,
+# что без IDE ничего не стартует. Скрипт сам находит venv рядом с собой и, если
+# модулей не видно, передаёт себя его интерпретатору. Модули при этом должны
+# быть уже установлены — просто находиться они будут сами.
+
+BOOTSTRAP_MARKER = "AIMTRACKER_BOOTSTRAPPED"   # защита от бесконечного перезапуска
+LAUNCHER_MARKER = "AIMTRACKER_LAUNCHER"        # выставляет run.bat, у него своя пауза
+PYTHON_OVERRIDE = "AIMTRACKER_PYTHON"          # путь к интерпретатору вручную
+VENV_DIRS = (".venv", "venv", "env", ".env")
+
+SCRIPT_PATH = os.path.abspath(__file__)
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+
+_console_held = [False]
+
+
+def hold_console(message="\nНажми Enter, чтобы закрыть окно..."):
+    """Не даёт окну консоли закрыться, пока не нажмёшь Enter.
+
+    Без этого двойной клик по файлу с ошибкой на старте выглядел так: окно
+    мигнуло и исчезло, прочитать стектрейс невозможно.
+
+    Из run.bat не спрашиваем — там своя pause, иначе Enter пришлось бы жать
+    дважды. И не спрашиваем, когда консоли нет (запуск из теста, перенаправленный
+    ввод): там ждать нажатия было бы вечным зависанием.
+    """
+    if _console_held[0] or os.environ.get(LAUNCHER_MARKER):
+        return
+    _console_held[0] = True
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return
+        input(message)
+    except (EOFError, KeyboardInterrupt, OSError, ValueError):
+        pass
+
+
+def _report_unhandled(exc_type, exc, tb):
+    traceback.print_exception(exc_type, exc, tb)
+    print("\n[Ошибка] Скрипт остановился из-за ошибки выше.")   # до настройки цвета
+    hold_console()
+
+
+def dependencies_present():
+    try:
+        import cv2, keyboard, mss, numpy, pyautogui  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def find_venv_python():
+    """Интерпретатор из venv рядом со скриптом, или заданный переменной среды."""
+    override = os.environ.get(PYTHON_OVERRIDE, "").strip().strip('"')
+    if override:
+        return override if os.path.isfile(override) else None
+    if os.name == "nt":
+        parts = ("Scripts", "python.exe")       # pythonw.exe не берём: он без консоли
+    else:
+        parts = ("bin", "python3")
+    for folder in VENV_DIRS:
+        candidate = os.path.join(SCRIPT_DIR, folder, *parts)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def explain_missing_dependencies():
+    print("[Запуск] Не хватает модулей, и venv рядом со скриптом не найден.")
+    print(f"         Скрипт лежит в: {SCRIPT_DIR}")
+    print(f"         Текущий питон:  {sys.executable}")
+    print("\n  Создать окружение и поставить модули (один раз, в этой папке):")
+    if os.name == "nt":
+        print("    py -m venv .venv")
+        print("    .venv\\Scripts\\python -m pip install -r requirements.txt")
+        print("\n  Дальше запускать run.bat — он сам найдёт .venv.")
+    else:
+        print("    python3 -m venv .venv")
+        print("    .venv/bin/python -m pip install -r requirements.txt")
+    print("\n  Если venv уже есть в другом месте, укажи путь к его питону:")
+    print(f"    set {PYTHON_OVERRIDE}=C:\\путь\\к\\venv\\Scripts\\python.exe")
+
+
+def bootstrap_dependencies():
+    """Перезапускает скрипт питоном из venv, если в текущем модулей нет."""
+    if dependencies_present():
+        return
+    if os.environ.get(BOOTSTRAP_MARKER):
+        # уже перезапускались — значит и в venv модулей нет, второй круг не поможет
+        print("[Запуск] Даже в venv не хватает модулей.")
+        explain_missing_dependencies()
+        hold_console()
+        raise SystemExit(1)
+
+    interpreter = find_venv_python()
+    if interpreter is None:
+        explain_missing_dependencies()
+        hold_console()
+        raise SystemExit(1)
+
+    print(f"[Запуск] В этом питоне модулей нет, перезапускаюсь через:\n         {interpreter}")
+    environment = dict(os.environ, **{BOOTSTRAP_MARKER: "1"})
+    # subprocess, а не os.execv: на Windows execv отпускает родителя сразу, и
+    # консоль (вместе с pause в run.bat) успевала закрыться под живым процессом
+    completed = subprocess.run([interpreter, SCRIPT_PATH] + sys.argv[1:], env=environment)
+    raise SystemExit(completed.returncode)
+
+
+sys.excepthook = _report_unhandled
+atexit.register(hold_console)
+bootstrap_dependencies()
+
+# Импорты модулей — после бутстрапа: до него их может просто не быть видно.
 import cv2
 import keyboard
 import mss
@@ -12,6 +134,146 @@ import numpy as np
 import pyautogui
 import tkinter as tk
 from PIL import Image
+
+
+# ---------- Вывод в консоль ----------
+# Живая строка состояния пишется поверх себя через \r, и любой обычный print
+# её бы разрезал. Поэтому print в этом модуле намеренно затенён: так все
+# существующие вызовы автоматически сначала убирают строку состояния, и не
+# пришлось переписывать шесть десятков мест.
+
+# ---------- Цвет ----------
+# Консоль Windows по умолчанию не разбирает ANSI-последовательности: их надо
+# разрешить вручную через SetConsoleMode. Делается один раз при старте, после
+# чего цвет ничего не стоит — живая строка перерисовывается 12 раз в секунду,
+# и лишние 40 байт на такой частоте не значат ничего.
+
+STD_OUTPUT_HANDLE = -11
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+SGR = {
+    "dim": "90", "bold": "1", "cyan": "36", "green": "32",
+    "yellow": "33", "red": "31", "blue": "94",
+}
+
+FRAME_BUDGET_MS = 1000.0 / 60.0   # 60 Гц: за этим порогом реакция не успевает к кадру
+
+_vt = {"ok": False}
+
+
+def enable_vt():
+    """Разрешает консоли разбирать ANSI. False — не вышло, цвета не будет."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_ulong()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+            return True
+        return bool(kernel32.SetConsoleMode(
+            handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+    except Exception:         # noqa: BLE001 — на любой осечке просто живём без цвета
+        return False
+
+
+def color_enabled():
+    """Красить ли вывод прямо сейчас.
+
+    'auto' отключает цвет там, где он превратился бы в мусор вида ←[32m:
+    консоль не умеет ANSI, вывод перенаправлен в файл, или пользователь
+    попросил через переменную NO_COLOR (общепринятое соглашение).
+    'on' красит через силу — на случай, если терминал ANSI умеет, а наше
+    определение этого не увидело.
+    """
+    if cfg.color == "off":
+        return False
+    if cfg.color == "on":
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        if not sys.stdout.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    return _vt["ok"]
+
+
+def paint(text, style=None):
+    if style is None or not color_enabled():
+        return text
+    return f"\x1b[{SGR[style]}m{text}\x1b[0m"
+
+
+def latency_style(ms):
+    """Цвет задержки относительно бюджета кадра: зелёный — с запасом,
+    жёлтый — ещё успеваем, красный — в кадр уже не уложились."""
+    if ms < FRAME_BUDGET_MS / 3:
+        return "green"
+    if ms < FRAME_BUDGET_MS:
+        return "yellow"
+    return "red"
+
+
+_real_print = print          # до def print ниже это ещё встроенный print
+_out_lock = threading.Lock()
+_status = {"width": 0, "shown": False}
+
+
+def console_width():
+    return shutil.get_terminal_size((80, 25)).columns
+
+
+def _clear_status_locked():
+    if not _status["shown"]:
+        return
+    if _vt["ok"]:
+        _real_print("\r\x1b[K", end="", flush=True)   # короче, чем простыня пробелов
+    else:
+        _real_print("\r" + " " * _status["width"] + "\r", end="", flush=True)
+    _status["shown"] = False
+
+
+def print(*args, **kwargs):          # noqa: A001 — затенение осознанное, см. выше
+    with _out_lock:
+        _clear_status_locked()
+        _real_print(*args, **kwargs)
+
+
+def clear_status():
+    with _out_lock:
+        _clear_status_locked()
+
+
+def show_status(segments):
+    """Пишет строку состояния поверх предыдущей.
+
+    Принимает не готовую строку, а куски (текст, стиль). Иначе обрезка по
+    ширине окна считала бы длину вместе с невидимыми ANSI-кодами и могла
+    разрубить последовательность посередине — на экран полез бы мусор.
+    А обрезать надо: строка длиннее окна перенеслась бы на вторую, и \r
+    возвращал бы курсор уже не туда — вместо живой строки вышла бы лестница.
+    """
+    limit = max(20, console_width() - 1)
+    pieces, visible = [], 0
+    for text, style in segments:
+        if visible >= limit:
+            break
+        text = text[:limit - visible]
+        visible += len(text)
+        pieces.append(paint(text, style))
+    body = "".join(pieces)
+
+    with _out_lock:
+        if _vt["ok"]:
+            _real_print("\r" + body + "\x1b[K", end="", flush=True)
+        else:
+            _real_print("\r" + body + " " * max(0, _status["width"] - visible),
+                        end="", flush=True)
+        _status["width"] = visible
+        _status["shown"] = True
+
 
 pyautogui.FAILSAFE = True  # двинь мышь в угол экрана, чтобы аварийно остановить pyautogui
 pyautogui.PAUSE = 0  # ВАЖНО: по умолчанию pyautogui сам добавляет 0.1с паузы после КАЖДОГО
@@ -71,7 +333,7 @@ class Config:
         self.lock_timeout = 0.35        # через столько секунд без детекций цель забывается (сек)
         self.move_smoothing = 1.0       # доля пути до цели за кадр: 1.0 = мгновенно, 0.3 = плавно
         self.dead_zone = 0              # не двигать курсор, если цель ближе стольких пикселей
-        self.debug_log = True           # печатать таймлоги каждой детекции
+        self.debug_log = False          # подробный таймлог каждой детекции (основной вид — строка состояния)
         self.save_last_frame = False    # сохранять last.jpg (лишняя запись на диск = задержка)
         self.auto_click = False
         self.click_interval = 0.0       # минимальная пауза между автокликами, сек (0 = каждую детекцию)
@@ -79,6 +341,9 @@ class Config:
                                          # False = быстрый режим с фоновым захватом экрана
         self.autosave = True            # сохранять активный профиль при выходе
         self.bench_on_boot = True       # прогонять бенчмарк один раз за загрузку компьютера
+        self.pause_on_start = False      # ждать Enter после вывода настроек, перед слежением
+        self.status_hz = 12             # как часто перерисовывать живую строку, раз/с (0 = не рисовать)
+        self.color = "auto"             # auto | on | off
 
 
 cfg = Config()
@@ -484,12 +749,14 @@ def set_overlay_enabled(enabled):
         _last_used_ts = 0.0
         grabber.start()
     reset_lock()
-    print(f"[Оверлей] {'ВКЛ (точнее, но медленнее)' if enabled else 'ВЫКЛ (быстрый режим, фоновый захват)'}")
+    print(paint("[Оверлей]", "cyan"),
+          "ВКЛ — рамка рисуется, захват синхронный (точнее, медленнее)" if enabled
+          else "ВЫКЛ — быстрый режим, кадры берутся из фонового потока")
 
 
 def toggle_autoclick():
     cfg.auto_click = not cfg.auto_click
-    print(f"[Автоклик] {'включен' if cfg.auto_click else 'выключен'}")
+    print(paint("[Автоклик]", "cyan"), "включен" if cfg.auto_click else "выключен")
 
 
 def panic_stop():
@@ -499,7 +766,7 @@ def panic_stop():
     у pyautogui там не сработает — эта клавиша его заменяет.
     """
     _stop.set()
-    print(f"\n[Стоп] Аварийная остановка по {PANIC_KEY.upper()}.")
+    print(paint(f"\n[Стоп] Аварийная остановка по {PANIC_KEY.upper()}.", "red"))
 
 
 keyboard.add_hotkey(AUTOCLICK_TOGGLE_KEY, toggle_autoclick)
@@ -626,6 +893,33 @@ def select_target(blobs, offset_x, offset_y):
     _lock["ts"] = now
     _lock["held"] = bool(chosen)
     return primary
+
+
+# Что показывает живая строка. Заполняется детекцией, читается главным циклом.
+_stat = {"target": None, "blobs": 0, "locked": False, "area": 0, "ms": 0.0}
+
+def render_status(key_name):
+    """Собирает живую строку как куски (текст, стиль).
+
+    Задержка красится по бюджету кадра, залипание на цель — отдельно: это два
+    числа, на которые смотрят в первую очередь, когда подбирают настройки.
+    """
+    way = "SendInput" if _aim["relative"] else "курсор"
+    if _stat["target"] is None:
+        return [(f"[{key_name}]", "cyan"), (" ищу цель…   ", None),
+                (f"прицел {_aim['crosshair']}   ", "dim"), (way, "dim")]
+    x, y = _stat["target"]
+    parts = [
+        (f"[{key_name}]", "cyan"),
+        (f" цель ({x},{y})", "bold"),
+        (f"  area {_stat['area']}px  пятен {_stat['blobs']}", None),
+    ]
+    if _stat["locked"]:
+        parts.append((" lock", "blue"))
+    parts.append(("  ", None))
+    parts.append((f"{_stat['ms']:.1f} мс", latency_style(_stat["ms"])))
+    parts.append((f"  {way}", "dim"))
+    return parts
 
 
 _move_remainder = {"x": 0.0, "y": 0.0}
@@ -764,6 +1058,9 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
     move_and_maybe_click(screen_cx, screen_cy)
     t4 = time.perf_counter()
 
+    _stat.update(target=(screen_cx, screen_cy), blobs=len(blobs), locked=_lock["held"],
+                 area=primary["area"], ms=(t4 - t0) * 1000)
+
     if cfg.debug_log:
         print(
             f"[sync] пятен={len(blobs)}{' [lock]' if _lock['held'] else ''} "
@@ -805,6 +1102,9 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
     maybe_save_last_frame(current, primary["bbox"], region_w, region_h)
     move_and_maybe_click(screen_cx, screen_cy)
     t2 = time.perf_counter()
+
+    _stat.update(target=(screen_cx, screen_cy), blobs=len(blobs), locked=_lock["held"],
+                 area=primary["area"], ms=(t2 - t0) * 1000)
 
     if cfg.debug_log:
         print(
@@ -895,7 +1195,7 @@ def print_help():
         "  show                         — то же самое, но коротким списком\n"
         "  set <имя> <значение>         — изменить переменную\n"
         "  set <имя>                    — показать одну переменную с описанием\n"
-        "  log on|off                   — вкл/выкл подробные логи по каждой детекции\n"
+        "  log on|off                   — подробный лог каждой детекции (по умолчанию выкл)\n"
         "  overlay on|off               — вкл/выкл рамку (F7 делает то же самое)\n"
         "  click on|off                 — вкл/выкл автоклик (F6 делает то же самое)\n"
         "  save on|off                  — сохранять last.jpg при детекции (тратит время!)\n"
@@ -905,6 +1205,9 @@ def print_help():
         "  profile save|load|delete|default|defaults\n"
         "  reset_config                 — стереть файл конфига (спросит подтверждение)\n"
         "  help                         — эта справка\n"
+        "\nПодробные объяснения:\n"
+        "  help <тема>                  — " + ", ".join(HELP_TOPICS) + "\n"
+        "  set <имя>                    — разбор одной настройки целиком\n"
     )
 
 
@@ -926,11 +1229,13 @@ MIN_VALUES = {
     "margin": 1,
     "camera_gain": 0.01,
     "click_interval": 0.0,
+    "status_hz": 0,
 }
 
 # значения-строки: что вообще можно вписать
 ALLOWED_VALUES = {
     "aim_mode": ("auto", "absolute", "relative"),
+    "color": ("auto", "on", "off"),
 }
 
 # верхние границы (нужны только там, где значение — доля)
@@ -938,6 +1243,7 @@ MAX_VALUES = {
     "move_smoothing": 1.0,
     "margin": min(center_x, center_y),   # больше — область слежения вылезет за край экрана
     "camera_gain": 5.0,
+    "status_hz": 60,
 }
 
 
@@ -1041,10 +1347,11 @@ SETTINGS_GROUPS = [
         ("overlay_enabled",   "рамка оверлея: on = точнее и медленнее, off = быстрый режим (F7)"),
         ("auto_click",        "кликать после наведения (F6)"),
         ("click_interval",    "минимальная пауза между кликами, сек: 0 = на каждой детекции"),
-        ("debug_log",         "печатать таймлог каждой детекции"),
+        ("debug_log",         "подробный таймлог на каждую детекцию; обычно хватает строки состояния"),
         ("save_last_frame",   "сохранять last.jpg при детекции — запись на диск добавляет задержку"),
         ("autosave",          "сохранять активный профиль при выходе"),
         ("bench_on_boot",     "гонять бенчмарк один раз за загрузку компьютера, а не каждый старт"),
+        ("pause_on_start",    "ждать Enter перед началом слежения, чтобы успеть прочитать вывод"),
     )),
 ]
 
@@ -1087,16 +1394,26 @@ def format_value(value):
 
 
 def print_settings_menu():
+    """Печатает все переменные с описаниями.
+
+    Описание идёт отдельной строкой под именем: в одну строку вместе со
+    значением и границами выходило под 130 символов, и хвосты уезжали за
+    край обычного окна консоли.
+    """
     print("\nНастраиваемые переменные. 'set <имя> <значение>' — изменить,")
-    print("'set <имя>' — показать одну с описанием.\n")
+    print("'set <имя>' — показать одну с описанием.")
+    wrap = max(40, min(console_width() - 1, 78)) - 8
     for title, items in settings_groups_full():
-        print(f"  {title}")
+        print("\n  " + paint(title.upper(), "bold"))
         for name, desc in items:
             value = getattr(cfg, name)
             hint = range_hint(name, value)
-            hint = f"[{hint}]" if hint else ""
-            print(f"    {name:<18}= {format_value(value):<13} {hint:<22} {desc}")
-        print()
+            # ljust до paint: иначе ширину считали бы вместе с невидимыми кодами
+            print(f"    {name:<18}{paint(format_value(value).ljust(14), 'green')}"
+                  f"{paint(hint, 'dim')}")
+            for line in textwrap.wrap(desc, wrap) or [""]:
+                print(f"        {line}")
+    print()
 
 
 def describe_setting(name):
@@ -1108,8 +1425,275 @@ def describe_setting(name):
     print(f"  {name} = {format_value(value)}" + (f"   [{hint}]" if hint else ""))
     desc = SETTINGS_INFO.get(name)
     if desc:
-        print(f"    {desc}")
+        width = max(40, min(console_width() - 1, 78)) - 4
+        for line in textwrap.wrap(desc, width):
+            print(f"    {line}")
+    long_text = SETTINGS_HELP.get(name)
+    if long_text:
+        print()
+        wrap_help(long_text, "    ")
+    else:
+        print()
     print(f"    изменить: set {name} <значение>")
+
+
+# Подробные объяснения: одной строки в 'edit' хватает, чтобы вспомнить, но не
+# чтобы понять впервые. Это показывает 'set <имя>' без значения.
+SETTINGS_HELP = {
+    "overlay_enabled": """\
+Выбор между двумя способами захвата экрана — это главная развилка в скрипте.
+
+ВКЛ (рамка). Перед каждой парой скриншотов рамка синхронно прячется, кадры
+снимаются подряд из главного потока, потом рамка рисуется заново. Так рамка
+не попадает в собственный скриншот (иначе она считалась бы изменением и
+разрасталась по кругу — это был настоящий баг). Зато каждый цикл ждёт
+перерисовки окна, и реакция медленнее.
+
+ВЫКЛ (быстрый). Рамки нет, зато отдельный поток непрерывно снимает экран, а
+главный цикл просто берёт последний готовый кадр, не ожидая захвата. Это
+быстрее, но съедает одно ядро процессора целиком, пока включено.
+
+Коротко: рамка нужна, когда подбираешь diff_threshold и min_blob_area и
+хочешь видеть, что скрипт считает целью. Для самой работы выключай.""",
+
+    "aim_mode": """\
+Как двигать мышь. Способов два, и в игре работает только один.
+
+absolute — курсор ставится в точку экрана. Так делает pyautogui, и
+на рабочем столе это работает. Но игра, захватившая курсор и читающая raw input
+(Minecraft в их числе), такого движения не видит вообще: оно не проходит
+через очередь ввода. Отсюда брался симптом "персонаж бьёт воздух, камера
+стоит".
+
+relative — мышь сдвигается на столько-то отсчётов, как настоящая мышь.
+Это игра видит. Прицел при этом считается не от курсора (его позиция под
+захватом ничего не значит), а от центра игрового окна.
+
+auto — relative, пока активно окно игры, absolute в остальное время. Так
+работает и в игре, и на рабочем столе, без переключений вручную.""",
+
+    "camera_gain": """\
+Насколько резко доворачивать камеру за кадр, от 0.01 до 5.
+
+Скрипт не знает, на сколько градусов повернётся камера от одного отсчёта
+мыши: это зависит от чувствительности и FOV в игре. Поэтому наводка идёт
+замкнутым контуром — сдвинули на долю ошибки, сняли экран заново, повторили,
+пока цель не придёт в прицел. Калибровать ничего не нужно, нужно только
+попасть в разумный коэффициент.
+
+Слишком много — камеру перебрасывает через цель и начинает раскачивать.
+Слишком мало — доворачивает вяло, цель уходит быстрее, чем догоняем.
+Подбирай так: начни с 0.5, при перелётах уменьшай вдвое, при вялости
+увеличивай на треть.""",
+
+    "lock_radius": """\
+Радиус залипания на прежнюю цель, в пикселях. 0 — выключить.
+
+Без залипания целью каждый кадр становится просто самое крупное пятно
+изменений. Как только два пятна меняются площадями местами, курсор прыгает
+между ними — на записи это выглядит как дёрганье.
+
+С залипанием: если прежняя цель ещё свежая (прошло меньше lock_timeout) и в
+этом радиусе от неё есть пятно, держимся за него, а не за самое большое.
+Больше радиус — упорнее держимся за одну цель, но легче "прилипнуть" к
+соседнему пятну. Меньше — охотнее переключаемся на новое.""",
+
+    "diff_threshold": """\
+Насколько сильно пиксель должен измениться, чтобы считаться изменением.
+Шкала 0-255, сравнивается максимум разницы по каналам цвета.
+
+Ниже порог — ловятся более слабые изменения, но вместе с ними анимация воды,
+качание травы, рука с предметом. Выше — остаётся только явное, но слабые
+частицы могут потеряться.
+
+Если пятен находится слишком много, сначала попробуй denoise_kernel: он
+убирает точечный шум, не повышая порог, и слабые цели при этом выживают.""",
+
+    "denoise_kernel": """\
+Размер фильтра точечного шума перед поиском пятен, в пикселях.
+0 — выключить.
+
+К маске изменений применяется морфологическое "открытие": одиночные шумные
+пиксели пропадают, а пятна из нескольких пикселей остаются. Это дёшево и
+делается ДО разметки связных областей.
+
+Зачем: сцена с постоянным мелким шумом (вода, трава) давала сотни и тысячи
+крошечных пятен, и сама разметка становилась дорогой — задержка подскакивала
+до 75-100 мс. Фильтр убирает их заранее. 3 обычно достаточно, 5 — для очень
+шумной сцены.""",
+
+    "move_smoothing": """\
+Только для absolute-режима (рабочий стол). Доля пути до цели за кадр.
+
+1.0 — курсор прыгает в цель мгновенно. 0.3 — проходит треть пути, и за
+несколько кадров подъезжает плавно. Для записи видео плавное движение
+выглядит человеческим, а не телепортом.
+
+В relative-режиме за это отвечает camera_gain, а эта настройка не
+используется.""",
+
+    "status_hz": """\
+Как часто перерисовывать живую строку состояния, раз в секунду. 0 — не
+рисовать вообще.
+
+Живая строка пишется из главного цикла, то есть из пути реакции. Сама запись
+в консоль дешёвая, но не бесплатная, и на Windows цену задаёт число
+обращений, а не длина строки. 12 раз в секунду глаз воспринимает как
+непрерывное обновление, а в бюджете кадра это незаметно.
+
+Если выжимаешь минимальную задержку — ставь 4 или 0. Цвет на это не влияет:
+лишние байты в уже совершаемой записи ничего не стоят.""",
+
+    "color": """\
+Цвет в выводе. auto | on | off.
+
+auto — красить, если консоль умеет ANSI, вывод идёт в терминал (а не в файл)
+и не задана переменная среды NO_COLOR. Это нужно, чтобы вместо цвета не
+посыпался мусор вида ←[32m.
+
+on — красить через силу. Пригодится, если терминал ANSI умеет, а определение
+этого не увидело.
+
+off — никогда. На скорость цвет не влияет.""",
+
+    "click_interval": """\
+Минимальная пауза между автокликами, в секундах. 0 — кликать на каждой
+детекции.
+
+Детекция идёт сотни раз в секунду, и автоклик без паузы столько же раз и
+жмёт. В игре это почти всегда вхолостую: у атаки своя перезарядка. Для меча
+в Minecraft осмысленное значение около 0.6.""",
+
+    "margin": """\
+Половина стороны квадрата, в котором идёт слежение по Ctrl, в пикселях.
+
+Квадрат строится вокруг прицела: в полноэкранной игре это центр экрана, в
+оконной — центр игрового окна. Меньше область — меньше кадр, быстрее
+детекция и меньше постороннего шума, но и цель легче упустить за границей.
+
+Режим Alt смотрит всё окно игры целиком и этой настройкой не ограничен.""",
+}
+
+# Темы для 'help <тема>': то, что не привязано к одной настройке.
+HELP_TOPICS = {
+    "режимы": ("Режимы захвата экрана", SETTINGS_HELP["overlay_enabled"]),
+    "прицел": ("Как скрипт наводит мышь", SETTINGS_HELP["aim_mode"]),
+    "детекция": ("Как находится цель", """\
+Скрипт не понимает, что на экране. Он снимает два кадра подряд и ищет, что
+между ними изменилось — поэтому и работает по частицам от разрушенного
+блока, по летящим предметам, по любому движению.
+
+Что происходит за один цикл:
+
+1. Два снимка области (по Ctrl — квадрат margin вокруг прицела, по Alt — всё
+   окно игры).
+2. Поиск разницы по каждому пикселю; всё, что изменилось сильнее
+   diff_threshold, попадает в маску.
+3. denoise_kernel убирает из маски точечный шум.
+4. Маска делится на связные области — "пятна". Пятна мельче min_blob_area
+   отбрасываются.
+5. Из оставшихся выбирается цель: самое крупное пятно, либо то, за которое
+   держит залипание (lock_radius).
+6. Мышь доворачивается к центру цели.
+
+Если целью становится не то, что нужно, крути именно в этом порядке:
+diff_threshold, потом denoise_kernel, потом min_blob_area. Включи рамку
+(F7), чтобы видеть, что скрипт считает пятнами: зелёная — выбранная цель,
+оранжевые — остальные."""),
+    "профили": ("Профили настроек", """\
+Настройки хранятся в aim_config.json рядом со скриптом, наборами под разные
+сцены — у воды и у разрушенного блока разный шум, и пороги к ним нужны
+разные.
+
+  profiles               список: что сохранено, что активно, что грузится
+  profile save <имя>     сохранить текущие настройки под этим именем
+  profile load <имя>     загрузить
+  profile default <имя>  какой профиль брать при запуске
+  profile delete <имя>   удалить (спросит подтверждение)
+  profile defaults       вернуть встроенные значения из кода
+  reset_config           стереть файл целиком (спросит подтверждение)
+
+Встроенные значения живут в самом коде, не в файле. Поэтому скрипт
+запускается и без конфига, а 'profile defaults' всегда может вернуть
+заведомо рабочий набор.
+
+При выходе активный профиль сохраняется сам (настройка autosave). После
+'profile defaults' и 'reset_config' — не сохраняется, иначе выход затёр бы
+то, что ты только что осознанно сбросил."""),
+    "скорость": ("Откуда берётся задержка", """\
+Реакция складывается из захвата экрана, поиска пятен и движения мыши.
+Команда 'bench' меряет первые два на твоём железе.
+
+Обычно почти всё время уходит на захват: вызов снимка экрана стоит
+фиксированно, почти независимо от размера области. Поиск пятен после
+перехода на OpenCV занимает доли миллисекунды на небольшой области.
+
+Важный предел: при мониторе 60 Гц между двумя РАЗНЫМИ кадрами проходит
+16.6 мс, и быстрее этого реагировать физически не на что — новой картинки
+просто ещё нет. Задержка в живой строке красится по этому порогу: зелёная —
+с запасом, жёлтая — ещё успеваем, красная — в кадр не уложились.
+
+Что реально помогает: выключить рамку (F7), уменьшить margin, поднять
+denoise_kernel на шумной сцене, уменьшить status_hz."""),
+}
+
+
+LIST_ITEM = re.compile(r"^(\s*)((?:\d+\.|[-*])\s+)(.*)$")
+
+
+def wrap_help(text, indent):
+    """Печатает длинный текст, переложив его под ширину окна.
+
+    Перенос делается на выводе, а не в самих строках: иначе любая правка
+    текста норовит вылезти за край, а в узком окне всё равно поехало бы.
+
+    Нумерованные и маркированные пункты переносятся с висячим отступом —
+    продолжение встаёт под текстом пункта, а не под его номером. Выровненные
+    по колонкам блоки (список команд) оставляем как есть: переложить их,
+    не потеряв выравнивание, нельзя.
+    """
+    width = max(40, min(console_width() - 1, 78)) - len(indent)
+    for block in text.split("\n\n"):
+        lines = block.split("\n")
+        if any(LIST_ITEM.match(line) for line in lines):
+            for item in _join_list_items(lines):
+                match = LIST_ITEM.match(item)
+                if not match:
+                    print(indent + item)
+                    continue
+                lead, marker, body = match.groups()
+                hang = len(lead) + len(marker)
+                for line in textwrap.wrap(body, width, initial_indent=lead + marker,
+                                          subsequent_indent=" " * hang) or [lead + marker]:
+                    print(indent + line)
+        elif any(line[:1].isspace() for line in lines if line):
+            for line in lines:                      # таблица команд: не трогаем
+                print(indent + line if line else "")
+        else:
+            for line in textwrap.wrap(" ".join(lines), width) or [""]:
+                print(indent + line)
+        print()
+
+
+def _join_list_items(lines):
+    """Склеивает продолжения пунктов, чтобы перенос считал пункт целиком."""
+    items = []
+    for line in lines:
+        if LIST_ITEM.match(line) or not items:
+            items.append(line)
+        else:
+            items[-1] += " " + line.strip()
+    return items
+
+
+def print_topic_help(name):
+    key = name.strip().lower()
+    if key not in HELP_TOPICS:
+        print(f"Нет такой темы: {name}. Доступны: {', '.join(HELP_TOPICS)}")
+        return
+    title, text = HELP_TOPICS[key]
+    print("\n  " + paint(title.upper(), "bold"))
+    wrap_help(text, "  ")
 
 
 def print_window_info():
@@ -1452,10 +2036,9 @@ def startup_load_config():
 
 
 def console_loop():
-    print_help()
     while True:
         try:
-            line = input().strip()
+            line = input("> ").strip()
         except EOFError:
             break
         if not line:
@@ -1464,7 +2047,10 @@ def console_loop():
         cmd = parts[0].lower()
         try:
             if cmd == "help":
-                print_help()
+                if len(parts) > 1:
+                    print_topic_help(" ".join(parts[1:]))
+                else:
+                    print_help()
             elif cmd == "show":
                 print_settings()
             elif cmd == "log":
@@ -1501,32 +2087,74 @@ def console_loop():
             print("Неверный формат команды. Введи 'help'.")
 
 
+def print_header():
+    """Компактная шапка вместо прежних пятнадцати строк подсказок.
+
+    Там всё шло одним весом — клавиши, настройки, поведение при ошибке, — и
+    читать это было нечем. Подробности остались в 'help' и 'edit'.
+    """
+    width = max(60, min(console_width() - 1, 78))
+    rule = paint("═" * width, "dim")
+    print("\n" + rule)
+    print("  " + paint("AimTracker", "bold"))
+    print(rule)
+    key = lambda k: paint(k, "cyan")           # noqa: E731 — локальный сокращатель
+    print(f"  {key('Ctrl')}  слежение у прицела        {key(AUTOCLICK_TOGGLE_KEY.upper())}  автоклик")
+    print(f"  {key('Alt')}   слежение по всему окну    {key(OVERLAY_TOGGLE_KEY.upper())}  рамка оверлея"
+          f"     {key(PANIC_KEY.upper())}  {paint('СТОП', 'red')}")
+    print()
+
+    last = _aim["last_match"]
+    if last is None:
+        where = f"окно игры не найдено, прицел в центре экрана ({center_x}, {center_y})"
+    else:
+        title, (left, top, w, h) = last
+        where = f"{title}  {w}x{h} @ ({left}, {top})"
+    print(f"  профиль {paint(_config['active'], 'bold')}    {where}")
+    mode = "рамка (точнее)" if cfg.overlay_enabled else "быстрый (без рамки)"
+    click = paint("вкл", "yellow") if cfg.auto_click else "выкл"
+    print(f"  захват {paint(mode, 'bold')}    автоклик {click}")
+    print()
+    print(f"  {paint('help', 'cyan')} — команды   {paint('edit', 'cyan')} — настройки   "
+          f"{paint('window', 'cyan')} — привязка к окну")
+    print(f"  {paint('help режимы', 'cyan')} — что такое захват   "
+          f"{paint('set <имя>', 'cyan')} — разбор настройки")
+    print(rule)
+
+
+_vt["ok"] = enable_vt()     # до любого цветного вывода: иначе первые строки выйдут серыми
 startup_load_config()
 set_overlay_enabled(cfg.overlay_enabled)  # запускает грабер, если оверлей выключен
+update_aim_context()        # чтобы шапка показала реальную привязку, а не "окно не найдено"
+print_header()
 # Бенчмарк — до запуска консоли: иначе команда из консоли (например
 # reset_config) успевала отработать в середине замера, а завершавшийся
 # следом бенчмарк своим save_config_file() воскрешал только что удалённый файл.
 maybe_run_startup_benchmark()
+
+if cfg.pause_on_start:
+    # до старта консольного потока: иначе он перехватил бы этот же Enter
+    try:
+        input("\n[Пауза] Enter — начать слежение ('set pause_on_start off' уберёт паузу)...")
+    except EOFError:
+        pass
+
 threading.Thread(target=console_loop, daemon=True).start()
 
-print("\nЗажми Ctrl — слежение в области у центра экрана.")
-print("Зажми Alt — слежение по всему экрану.")
-print(f"{AUTOCLICK_TOGGLE_KEY.upper()} / 'click on|off' — автоклик.")
-print(f"{OVERLAY_TOGGLE_KEY.upper()} / 'overlay on|off' — рамка оверлея (выключи для максимальной скорости).")
-print(f"{PANIC_KEY.upper()} — аварийная остановка (в игре угловой failsafe не сработает).")
-print("Для плавного движения на записи: 'set move_smoothing 0.3' и 'set dead_zone 2'.")
-print("В игре наводка идёт относительными смещениями; 'window' покажет привязку,")
-print("'set camera_gain 0.3' — если камеру перебрасывает через цель.")
-print("'edit' — все настройки, 'profiles' — профили. Отступ Ctrl меняется на лету: 'set margin 150'.")
+
+_status_next = [0.0]
+_was_tracking = [False]
 
 try:
     while not _stop.is_set():
         found = False
+        tracking_key = None
         # прицел и способ движения пересчитываем каждую итерацию: окно игры
         # можно свернуть, подвинуть или переключиться из него в другое
         viewport = update_aim_context()
 
         if keyboard.is_pressed(TRACK_KEY):
+            tracking_key = "Ctrl"
             # снимок на итерацию: margin правится из консоли прямо во время работы
             margin = int(cfg.margin)
             cross_x, cross_y = _aim["crosshair"]
@@ -1534,6 +2162,7 @@ try:
                 cross_x - margin, cross_y - margin, margin * 2, margin * 2)
             found = track(left, top, width, height, offset_x=left, offset_y=top)
         elif keyboard.is_pressed(FULLSCREEN_KEY):
+            tracking_key = "Alt"
             # когда игра идёт в окне, незачем разглядывать остальной рабочий стол
             if viewport is None:
                 left, top, width, height = 0, 0, screen_width, screen_height
@@ -1543,15 +2172,33 @@ try:
 
         if not found and cfg.overlay_enabled:
             overlay.hide_all_and_wait()
+        if not found:
+            _stat["target"] = None
+
+        # Живая строка идёт только пока держишь клавишу слежения. Иначе она
+        # затирала бы приглашение "> ", на котором ты печатаешь команду: без
+        # ANSI развести их по разным строкам нечем, а в момент слежения руки
+        # всё равно на клавише и мыши, а не на клавиатуре.
+        now = time.perf_counter()
+        if tracking_key is not None and cfg.status_hz > 0:
+            if now >= _status_next[0]:
+                _status_next[0] = now + 1.0 / cfg.status_hz
+                show_status(render_status(tracking_key))
+            _was_tracking[0] = True
+        elif _was_tracking[0]:
+            _was_tracking[0] = False
+            clear_status()
+            _real_print("> ", end="", flush=True)   # возвращаем приглашение на место
 
         time.sleep(cfg.scan_interval)
 except pyautogui.FailSafeException:
     # Пользователь сам увёл курсор в угол — это штатный аварийный тормоз,
     # а не ошибка, так что выходим без стектрейса.
-    print("\n[Стоп] Курсор в углу экрана — аварийная остановка pyautogui.")
+    print(paint("\n[Стоп] Курсор в углу экрана — аварийная остановка pyautogui.", "red"))
 except KeyboardInterrupt:
-    print("\n[Стоп] Прервано с клавиатуры.")
+    print(paint("\n[Стоп] Прервано с клавиатуры.", "yellow"))
 finally:
+    clear_status()
     grabber.stop()
     if cfg.autosave and _config["data"] is not None and _config["autosave_ok"]:
         profile_save(_config["active"])
