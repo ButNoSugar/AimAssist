@@ -88,19 +88,22 @@ for mode in ("off", "on"):
     menu = ESC.sub("", grab(G['print_settings_menu']))
     lines = menu.splitlines()
     widest = max(len(l) for l in lines)
-    # раскладка: имя с 4-й колонки, значение с 22-й, границы с 36-й
-    wrong = []
+    # колонка значений должна быть одна и та же у всех строк, где бы она ни была
+    wrong, value_columns = [], set()
     for name in vars(cfg):
         row = next((l for l in lines if l.startswith(f"    {name} ")
                     or l.rstrip() == f"    {name}"), None)
         if row is None:
             wrong.append((name, "строки нет")); continue
-        if row[4:22].strip() != name:
-            wrong.append((name, f"имя не в своей колонке: {row[4:22]!r}"))
         want = G['format_value'](getattr(cfg, name))
-        if row[22:36].strip() != want:
-            wrong.append((name, f"значение не в колонке 22: {row[22:36]!r} вместо {want!r}"))
-    check(f"color={mode}: имя и значение в своих колонках", not wrong, f"  {wrong[:3]}")
+        at = row.find(want, 4 + len(name))
+        if at < 0:
+            wrong.append((name, f"значения {want!r} нет в строке"))
+        else:
+            value_columns.add(at)
+    check(f"color={mode}: у каждой настройки есть строка", not wrong, f"  {wrong[:3]}")
+    check(f"color={mode}: колонка значений одна для всех",
+          len(value_columns) == 1, f"  колонки: {sorted(value_columns)}")
     check(f"color={mode}: нет строк шире 80", widest <= 80, f"  ({widest})")
 cfg.color = "off"
 

@@ -27,7 +27,20 @@ sys.modules["pyautogui"] = pyautogui
 
 # --- keyboard ---
 keyboard = types.ModuleType("keyboard")
-keyboard.add_hotkey = lambda *a, **k: None
+keyboard.HOTKEYS = []
+def _add_hotkey(name, action, *a, **k):
+    keyboard.HOTKEYS.append(name)
+    return name
+keyboard.add_hotkey = _add_hotkey
+def _remove_hotkey(handle):
+    if handle in keyboard.HOTKEYS: keyboard.HOTKEYS.remove(handle)
+keyboard.remove_hotkey = _remove_hotkey
+VALID_KEYS = {"ctrl", "alt", "shift", "tab", "space", "x", "z", "v"} | {f"f{i}" for i in range(1, 13)}
+def _key_to_scan_codes(name):
+    if name not in VALID_KEYS: raise ValueError(f"unknown key {name!r}")
+    return (1,)
+keyboard.key_to_scan_codes = _key_to_scan_codes
+keyboard.HELD = set()          # какие клавиши тест считает зажатыми
 keyboard.PRESSES = {"ctrl": 0, "alt": 0}
 keyboard.LIMIT = [0]
 keyboard.EOF = [False]
@@ -133,6 +146,9 @@ class _U32:
     def GetParent(self, h): return 0
     def GetWindowLongW(self, h, i): return 0
     def SetWindowLongW(self, h, i, v): return 0
+    MOUSE_DOWN = set()         # какие боковые кнопки мыши тест считает зажатыми
+    def GetAsyncKeyState(self, code):
+        return 0x8000 if code in self.MOUSE_DOWN else 0
     def GetForegroundWindow(self): return WIN["hwnd"]
     def GetWindowTextLengthW(self, h): return len(WIN["title"]) if h == WIN["hwnd"] else 0
     def GetWindowTextW(self, h, buf, n):
