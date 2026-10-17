@@ -132,6 +132,13 @@ WIN = {
     "title": "Minecraft* 1.20.1 - Singleplayer",
     "client": (100, 50, 800, 600),
     "sent": [],
+    # список окон для EnumWindows: hwnd -> (заголовок, exe, left, top, w, h)
+    "windows": {
+        4242: ("Minecraft* 1.20.1 - Singleplayer", "javaw.exe", 100, 50, 800, 600),
+        7: ("Блокнот", "notepad.exe", 0, 0, 400, 300),
+        8: ("крошечное окно", "tray.exe", 0, 0, 50, 50),
+        9: ("", "noname.exe", 0, 0, 900, 700),
+    },
 }
 class _SendInput:
     """Вызывается как функция, но допускает присваивание argtypes/restype."""
@@ -150,19 +157,37 @@ class _U32:
     def GetAsyncKeyState(self, code):
         return 0x8000 if code in self.MOUSE_DOWN else 0
     def GetForegroundWindow(self): return WIN["hwnd"]
-    def GetWindowTextLengthW(self, h): return len(WIN["title"]) if h == WIN["hwnd"] else 0
+    def IsWindowVisible(self, h): return 1 if h in WIN["windows"] else 0
+    def EnumWindows(self, callback, lparam):
+        for h in WIN["windows"]:
+            if not callback(h, lparam): break
+        return 1
+    def GetWindowThreadProcessId(self, h, ref):
+        ref._obj.value = 1000 + (h if isinstance(h, int) else 0)
+        return 1
+    def _title(self, h):
+        if h == WIN["hwnd"]: return WIN["title"]
+        entry = WIN["windows"].get(h)
+        return entry[0] if entry else ""
+    def _rect(self, h):
+        if h == WIN["hwnd"]: return WIN["client"]
+        entry = WIN["windows"].get(h)
+        return entry[2:6] if entry else None
+    def GetWindowTextLengthW(self, h): return len(self._title(h))
     def GetWindowTextW(self, h, buf, n):
-        buf.value = (WIN["title"] if h == WIN["hwnd"] else "")[:n - 1]
+        buf.value = self._title(h)[:n - 1]
         return len(buf.value)
     def GetClientRect(self, h, ref):
-        if h != WIN["hwnd"]: return 0
+        rect = self._rect(h)
+        if rect is None: return 0
         r = ref._obj; r.left = r.top = 0
-        r.right, r.bottom = WIN["client"][2], WIN["client"][3]
+        r.right, r.bottom = rect[2], rect[3]
         return 1
     def ClientToScreen(self, h, ref):
-        if h != WIN["hwnd"]: return 0
+        rect = self._rect(h)
+        if rect is None: return 0
         pt = ref._obj
-        pt.x += WIN["client"][0]; pt.y += WIN["client"][1]
+        pt.x += rect[0]; pt.y += rect[1]
         return 1
 class _K32:
     TICKS = [3600_000]
@@ -170,6 +195,14 @@ class _K32:
     MODE = [0]
     def GetTickCount64(self): return self.TICKS[0]
     def GetStdHandle(self, which): return 7
+    def OpenProcess(self, access, inherit, pid): return pid
+    def CloseHandle(self, handle): return 1
+    def QueryFullProcessImageNameW(self, handle, flags, buf, size):
+        hwnd = handle - 1000
+        entry = WIN["windows"].get(hwnd)
+        if not entry: return 0
+        buf.value = "C:\\games\\" + entry[1]
+        return 1
     def GetConsoleMode(self, handle, ref):
         if not self.VT_OK[0]: return 0
         ref._obj.value = self.MODE[0]

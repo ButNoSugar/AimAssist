@@ -115,7 +115,7 @@ quiet(G['apply_setting'], "track_key", "ctrl")
 print("== 7: переключатели переезжают на новую клавишу ==")
 keyboard.HOTKEYS.clear()
 quiet(G['rebind_hotkeys'])
-check("повешены три переключателя", sorted(keyboard.HOTKEYS) == ["f6", "f7", "f8"],
+check("повешены все переключатели", sorted(keyboard.HOTKEYS) == ["f6", "f7", "f8", "f9"],
       f"  {sorted(keyboard.HOTKEYS)}")
 quiet(G['apply_setting'], "panic_key", "f10")
 check("смена настройки перевесила", "f10" in keyboard.HOTKEYS and "f8" not in keyboard.HOTKEYS,

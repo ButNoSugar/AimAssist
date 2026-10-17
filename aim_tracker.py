@@ -308,7 +308,9 @@ pyautogui.PAUSE = 0  # ВАЖНО: по умолчанию pyautogui сам до
 # Боковые кнопки мыши: keyboard их не видит, спрашиваем систему напрямую.
 MOUSE_KEYS = {"mouse4": 0x05, "mouse5": 0x06}      # VK_XBUTTON1 / VK_XBUTTON2
 KEY_SETTINGS = ("track_key", "fullscreen_key", "autoclick_key",
-                "overlay_key", "panic_key")
+                "overlay_key", "panic_key", "dump_key")
+
+TUNE_DIR = "tune"
 
 PRIMARY_COLOR = "#00FF00"
 SECONDARY_COLOR = "#FFA500"
@@ -348,7 +350,8 @@ def require_windows():
 class Config:
     def __init__(self):
         self.aim_mode = "auto"          # auto | absolute | relative (см. move_and_maybe_click)
-        self.window_title = "Minecraft"  # ключевое слово в заголовке окна игры (пусто = не привязываться)
+        self.window_exe = ""            # имя exe окна игры, задаётся через 'window pick'
+        self.window_title = "Minecraft"  # запасной способ: ключевое слово в заголовке
         self.track_key = "ctrl"         # держать — слежение в области у прицела
         self.fullscreen_key = "alt"     # держать — слежение по всему окну
         self.autoclick_key = "f6"       # переключатель автоклика
@@ -380,6 +383,9 @@ class Config:
         self.autosave = True            # сохранять активный профиль при выходе
         self.bench_on_boot = True       # прогонять бенчмарк один раз за загрузку компьютера
         self.pause_on_start = False      # ждать Enter после вывода настроек, перед слежением
+        self.tune_mode = False          # отладочный режим: разметка блобов и кадры на диск
+        self.tune_frames = 20           # сколько последних кадров держать для сброса
+        self.dump_key = "f9"            # сбросить накопленные кадры на диск
         self.status_hz = 12             # как часто перерисовывать живую строку, раз/с (0 = не рисовать)
         self.color = "auto"             # auto | on | off
 
@@ -459,6 +465,72 @@ TITLE_CACHE_TTL = 0.5
 _window_cache = {"hwnd": 0, "title": "", "ts": 0.0}
 
 
+# EnumWindows хочет функцию по соглашению stdcall; на не-Windows такого типа
+# в ctypes нет, и подставляется обычный — туда мы всё равно не попадаем.
+WNDENUMPROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+MIN_PICKABLE_SIDE = 200          # окна мельче — служебные, в списке только мешают
+
+
+def process_name(hwnd):
+    """Имя исполняемого файла окна.
+
+    Берём именно его, а не заголовок: заголовок переписывают лаунчеры и моды,
+    а exe у игры один и тот же.
+    """
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    pid = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return ""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not handle:
+        return ""
+    try:
+        size = ctypes.c_ulong(260)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buffer.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def list_windows():
+    """Видимые окна, в которые есть смысл целиться: [(hwnd, заголовок, exe, область)].
+
+    Показываем ОКНА, а не процессы: у одной программы процессов бывает
+    несколько, и в диспетчере задач не понять, который из них рисует картинку.
+    """
+    found = []
+
+    def _collect(hwnd, _lparam):
+        if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            return True
+        title = window_text(hwnd)
+        if not title.strip():
+            return True
+        rect = client_rect_on_screen(hwnd)
+        if rect is None or rect[2] < MIN_PICKABLE_SIDE or rect[3] < MIN_PICKABLE_SIDE:
+            return True
+        found.append((hwnd, title, process_name(hwnd), rect))
+        return True
+
+    ctypes.windll.user32.EnumWindows(WNDENUMPROC(_collect), 0)
+    return found
+
+
+def window_matches(title, exe):
+    """Подходит ли окно под текущую привязку."""
+    wanted_exe = cfg.window_exe.strip().lower()
+    if wanted_exe:
+        return exe.lower() == wanted_exe
+    needle = cfg.window_title.strip().lower()
+    return bool(needle) and needle in title.lower()
+
+
 def foreground_window_title():
     """(hwnd, заголовок) активного окна, с кэшем на заголовок.
 
@@ -531,10 +603,11 @@ def update_aim_context():
     Возвращает область игры или None (обычный рабочий стол).
     """
     viewport = None
-    needle = cfg.window_title.strip().lower()   # ключевое слово, а не весь заголовок
-    if needle:
+    if cfg.window_exe.strip() or cfg.window_title.strip():
         hwnd, title = foreground_window_title()
-        if hwnd and needle in title.lower():
+        # exe спрашиваем только когда он задан: это обращение к чужому процессу
+        exe = process_name(hwnd) if (hwnd and cfg.window_exe.strip()) else ""
+        if hwnd and window_matches(title, exe):
             viewport = client_rect_on_screen(hwnd)
             if viewport is not None:
                 _aim["last_match"] = (title, viewport)
@@ -847,7 +920,8 @@ def rebind_hotkeys():
     _hotkeys = []
     for name, action in ((cfg.autoclick_key, toggle_autoclick),
                          (cfg.overlay_key, lambda: set_overlay_enabled(not cfg.overlay_enabled)),
-                         (cfg.panic_key, panic_stop)):
+                         (cfg.panic_key, panic_stop),
+                         (cfg.dump_key, dump_tune_frames)):
         low = name.strip().lower()
         if low in MOUSE_KEYS:
             print(paint("[Клавиши]", "yellow"),
@@ -869,7 +943,13 @@ def panic_stop():
 
     В относительном режиме курсор по экрану не ездит, поэтому угловой failsafe
     у pyautogui там не сработает — эта клавиша его заменяет.
+
+    В отладочном режиме у неё другая роль: пауза, а повторным нажатием —
+    очистка папки с кадрами.
     """
+    if cfg.tune_mode:
+        tune_pause_toggle()
+        return
     _stop.set()
     print(paint(f"\n[Стоп] Аварийная остановка по {cfg.panic_key.upper()}.", "red"))
 
@@ -929,7 +1009,8 @@ def find_blobs_arr(arr1_bgra, arr2_bgra, threshold, min_area, denoise_kernel=0):
     трёх каналах), и OpenCV вынужден копировать его целиком. Альфа у mss
     константная, поэтому absdiff по ней всегда 0 и на максимум не влияет.
 
-    Возвращает (пятна, доля изменившихся пикселей). Доля нужна, чтобы отличить
+    Возвращает (пятна, доля изменившихся пикселей). Отсеянные по min_area
+    пятна в отладочном режиме складываются в _detect["rejected"]. Доля нужна, чтобы отличить
     цель от разворота камеры: при повороте меняется почти весь кадр.
 
     Разница считается через absdiff/max/threshold, то есть в uint8 и на SIMD.
@@ -954,16 +1035,24 @@ def find_blobs_arr(arr1_bgra, arr2_bgra, threshold, min_area, denoise_kernel=0):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     changed = cv2.countNonZero(mask) / float(mask.size)
     num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    blobs = []
+    blobs, rejected = [], []
     for label_id in range(1, num_labels):
         x, y, w, h, area = stats[label_id]
         if area < min_area:
+            # в отладочном режиме их рисуют серым: видно, что именно режет порог
+            if cfg.tune_mode:
+                rejected.append({
+                    "bbox": (int(x), int(y), int(x + w), int(y + h)),
+                    "area": int(area),
+                    "center": (int(x + w // 2), int(y + h // 2)),
+                })
             continue
         blobs.append({
             "bbox": (int(x), int(y), int(x + w), int(y + h)),
             "area": int(area),
             "center": (int(x + w // 2), int(y + h // 2)),
         })
+    _detect["rejected"] = rejected
     return blobs, changed
 
 
@@ -1018,6 +1107,9 @@ def select_target(blobs, offset_x, offset_y):
     _lock["held"] = bool(chosen)
     return primary
 
+
+# Побочные данные детекции: нужны только отладочному режиму, в боевом пустые.
+_detect = {"rejected": [], "mode": "Margin"}   # mode заполняет главный цикл
 
 # Что показывает живая строка. Заполняется детекцией, читается главным циклом.
 _stat = {"target": None, "blobs": 0, "locked": False, "area": 0, "ms": 0.0,
@@ -1255,6 +1347,10 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
     maybe_save_last_frame(arr2, primary["bbox"], region_w, region_h)
     move_and_maybe_click(screen_cx, screen_cy)
     t4 = time.perf_counter()
+    # время меряем ДО разметки и записи: иначе цифра врала бы именно о том,
+    # что этим режимом и настраивают
+    capture_tune_frame(blobs, primary, (region_left, region_top, region_w, region_h),
+                       _detect["mode"], (t4 - t0) * 1000)
 
     _stat.update(target=(screen_cx, screen_cy), blobs=len(blobs), locked=_lock["held"],
                  area=primary["area"], ms=(t4 - t0) * 1000, motion=0.0)
@@ -1304,6 +1400,8 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
     maybe_save_last_frame(current, primary["bbox"], region_w, region_h)
     move_and_maybe_click(screen_cx, screen_cy)
     t2 = time.perf_counter()
+    capture_tune_frame(blobs, primary, (region_left, region_top, region_w, region_h),
+                       _detect["mode"], (t2 - t0) * 1000)
 
     _stat.update(target=(screen_cx, screen_cy), blobs=len(blobs), locked=_lock["held"],
                  area=primary["area"], ms=(t2 - t0) * 1000, motion=0.0)
@@ -1400,6 +1498,7 @@ COMMANDS = (
     ("help <имя>", "разбор одной настройки целиком"),
     ("set <имя> <знач>", "изменить настройку"),
     ("window", "к какому окну привязан прицел и как двигается мышь"),
+    ("window pick", "выбрать окно игры из списка открытых"),
     ("bench", "замерить скорость захвата и детекции"),
     ("profile", "профили настроек: список и управление"),
     ("reset_config", "стереть файл конфига (спросит подтверждение)"),
@@ -1440,6 +1539,7 @@ MIN_VALUES = {
     "camera_gain": 0.01,
     "click_interval": 0.0,
     "status_hz": 0,
+    "tune_frames": 1,
     "box_hold": 0.0,
     "margin_preview": 0.0,
     "settle_after_action": 0.0,
@@ -1561,7 +1661,8 @@ SETTINGS_GROUPS = [
     )),
     ("Прицел в игре", (
         ("aim_mode",          "auto = относительное движение, когда активно окно игры, иначе абсолютное"),
-        ("window_title",      "ключевое слово в заголовке окна игры; пусто — не привязываться к окну"),
+        ("window_exe",        "имя exe окна игры; задаётся командой 'window pick'"),
+        ("window_title",       "запасной способ: ключевое слово в заголовке окна"),
         ("camera_gain",       "доля ошибки за кадр в относительном режиме: больше — резче, но с перелётом"),
         ("settle_after_action", "сколько не снимать кадры после своего движения или клика, сек"),
         ("global_motion_limit", "доля изменившегося кадра, выше которой это разворот камеры, а не цель"),
@@ -1591,6 +1692,9 @@ SETTINGS_GROUPS = [
         ("autosave",          "сохранять активный профиль при выходе"),
         ("bench_on_boot",     "гонять бенчмарк один раз за загрузку компьютера, а не каждый старт"),
         ("pause_on_start",    "ждать Enter перед началом слежения, чтобы успеть прочитать вывод"),
+        ("tune_mode",         "отладочный режим: разметка блобов и кадры на диск"),
+        ("tune_frames",       "сколько последних размеченных кадров держать для сброса"),
+        ("dump_key",          "клавиша сброса накопленных кадров на диск"),
     )),
 ]
 
@@ -1820,6 +1924,18 @@ margin. 0 — не показывать.
 детекцию: квадрат тоже нельзя снимать вместе с экраном.""",
 
 
+    "window_exe": """\
+Имя исполняемого файла окна игры, например javaw.exe. Пусто — искать по
+заголовку (window_title).
+
+Задаётся командой window pick: она показывает открытые окна списком, и ты
+выбираешь номером. Лезть в диспетчер задач не нужно — и это важно, потому
+что там видны ПРОЦЕССЫ, а у одной программы их бывает несколько, и какой из
+них рисует картинку, по списку процессов не понять.
+
+Имя exe надёжнее заголовка: заголовок переписывают лаунчеры и моды, а exe
+у игры один и тот же. Если exe задан, window_title не используется.""",
+
     "window_title": """\
 Ключевое слово, по которому ищется окно игры. Пусто — не привязываться к
 окну вообще, тогда прицел считается центром экрана.
@@ -1959,6 +2075,44 @@ margin. 0 — не показывать.
 запуски до перезагрузки показывают сохранённые цифры. Выключи, если замер
 мешает; перемерить вручную всегда можно командой bench.""",
 
+    "tune_mode": """\
+Отладочный режим для подбора настроек. Выключен по умолчанию.
+
+Каждая детекция снимает ВЕСЬ экран, размечает его и кладёт в кольцевой
+буфер последних tune_frames кадров. Разметка:
+
+  зелёный  — цель, на которую пойдёт курсор
+  жёлтый   — прошли порог площади, но не выбраны
+  серый    — отсеяны min_blob_area
+  голубой  — граница области слежения
+
+В углу панель: версия, режим, размеры экрана и три главных порога, а ниже
+координаты цели, её площадь, число пятен и время реакции. Время меряется
+ДО разметки и записи — иначе цифра врала бы именно о том, что ты
+настраиваешь.
+
+Клавиша dump_key пишет буфер на диск, каждый сброс в свою папку внутри
+tune/. Клавиша остановки в этом режиме не завершает работу, а ставит паузу:
+успеваешь скопировать нужные кадры, повторное нажатие стирает папку и
+продолжает.
+
+Режим заведомо медленнее боевого: съёмка всего экрана, отрисовка и
+кодирование стоят десятков миллисекунд на кадр.""",
+
+    "tune_frames": """\
+Сколько последних размеченных кадров держать в памяти для сброса на диск.
+
+Хранятся сжатыми в JPEG, два десятка кадров — это порядка десятка мегабайт.
+Больше значение — длиннее история перед интересным моментом, но и памяти
+больше.""",
+
+    "dump_key": """\
+Клавиша, которая пишет накопленные отладочные кадры на диск.
+
+Каждое нажатие создаёт внутри tune/ папку с отметкой времени, так что
+предыдущие сбросы не затираются. Работает только в отладочном режиме —
+в боевом буфер не наполняется.""",
+
     "pause_on_start": """\
 Ждать Enter после стартового вывода, перед началом слежения.
 
@@ -2086,6 +2240,59 @@ def _join_list_items(lines):
     return items
 
 
+def pick_window():
+    """Показывает список открытых окон и даёт выбрать нужное номером.
+
+    Так не приходится лезть в диспетчер задач и гадать, какой из процессов
+    игры рисует картинку. Запоминается имя exe: оно переживает смену
+    заголовка лаунчером или модом.
+    """
+    try:
+        windows = list_windows()
+    except Exception as exc:              # noqa: BLE001 — выбору падать незачем
+        print(paint("[Окно]", "red"), f"не удалось перечислить окна: {exc}")
+        return
+    if not windows:
+        print(paint("[Окно]", "yellow"), "подходящих окон не найдено.")
+        return
+
+    print()
+    for number, (_hwnd, title, exe, (left, top, width, height)) in enumerate(windows, 1):
+        short = title if len(title) <= 42 else title[:41] + "…"
+        print(f"  {paint(str(number).rjust(2), 'cyan')}  {short:<43}"
+              f"{paint(exe or '?', 'green'):<22}{paint(f'{width}x{height}', 'dim')}")
+    print(f"\n  {paint('0', 'cyan')}   не привязываться к окну (прицел в центре экрана)")
+
+    try:
+        answer = input("\n  Номер окна: ").strip()
+    except EOFError:
+        return
+    if not answer.isdigit() or not 0 <= int(answer) <= len(windows):
+        print(paint("[Окно]", "yellow"), "не понял номер, ничего не меняю.")
+        return
+
+    choice = int(answer)
+    if choice == 0:
+        cfg.window_exe = ""
+        cfg.window_title = ""
+        print(paint("[Окно]", "green"), "привязка снята, прицел в центре экрана.")
+        return
+
+    _hwnd, title, exe, _rect = windows[choice - 1]
+    if exe:
+        cfg.window_exe = exe
+        cfg.window_title = ""
+        print(paint("[Окно]", "green"), f"привязано к {exe}")
+    else:
+        # имя процесса не отдалось (бывает с окнами от системы) — остаётся заголовок
+        cfg.window_exe = ""
+        cfg.window_title = title.split()[0] if title.split() else title
+        print(paint("[Окно]", "yellow"),
+              f"имя процесса недоступно, привязываюсь по слову {cfg.window_title!r}")
+    _window_cache["ts"] = 0.0
+    update_aim_context()
+
+
 def print_window_info():
     """Диагностика привязки к окну: без неё непонятно, почему не наводится.
 
@@ -2093,8 +2300,13 @@ def print_window_info():
     команду в консоли, активна именно консоль, так что первое почти всегда
     будет "не совпадает" — смотреть надо на второе.
     """
-    needle = cfg.window_title.strip()
-    print(f"\n  Ключевое слово:  {needle!r}")
+    if cfg.window_exe.strip():
+        print(f"\n  Привязка по exe: {paint(cfg.window_exe, 'green')}")
+    elif cfg.window_title.strip():
+        print(f"\n  Ключевое слово:  {cfg.window_title!r}")
+    else:
+        print("\n  " + paint("Привязки нет: прицел считается центром экрана.", "yellow"))
+    print(f"  {paint('window pick', 'cyan')} — выбрать окно из списка")
 
     last = _aim["last_match"]
     if last is None:
@@ -2116,6 +2328,172 @@ def print_window_info():
     print(f"  Движение мыши:   {way}   (aim_mode={cfg.aim_mode})")
     print("  " + paint("Абсолютное движение игра с raw input не увидит.", "dim") + "\n")
 
+
+
+
+# ---------- Отладочный режим ----------
+# Разметка идёт прямо на кадре через OpenCV, а не оверлеем: кадр уже в памяти,
+# подписи латиницей (cv2.putText кириллицу не умеет), и результат — файл,
+# который можно разглядывать сколько угодно, в отличие от мелькнувшей рамки.
+
+TUNE_TARGET_COLOR = (0, 255, 0)        # BGR: цель
+TUNE_CANDIDATE_COLOR = (0, 255, 255)   # подходящие, но не выбранные
+TUNE_REJECTED_COLOR = (180, 180, 180)  # отсеянные по min_blob_area
+TUNE_REGION_COLOR = (255, 191, 0)      # граница области слежения
+TUNE_TEXT_COLOR = (0, 0, 255)
+TUNE_JPEG_QUALITY = 80
+
+_tune = {"frames": [], "paused": False, "dumps": 0}
+
+
+def tune_panel_lines(mode_name, target, area, blobs, reaction_ms):
+    """Строки отладочной панели. Только латиница: cv2.putText иначе не нарисует."""
+    aim_way = "relative" if _aim["relative"] else "absolute"
+    lines = [
+        f"AimAssist Ver. {__version__} - {mode_name} - {aim_way}",
+        "",
+        f"Screen - {screen_width}x{screen_height}",
+        f"margin - {int(cfg.margin)}px",
+        f"diff_threshold - {cfg.diff_threshold}",
+        f"min_blob_area - {cfg.min_blob_area}",
+        f"denoise_kernel - {cfg.denoise_kernel}",
+        "",
+        "Detection",
+        f"Target - {target[0]},{target[1]}" if target else "Target - none",
+        f"Area - {area} px",
+        f"Blobs - {blobs}" + (f" (+{len(_detect['rejected'])} ignored)"
+                              if _detect["rejected"] else ""),
+        f"Reaction Time - {reaction_ms:.1f} ms",
+    ]
+    return lines
+
+
+def annotate_tune_frame(frame_bgra, offset, blobs, primary, region, mode_name, reaction_ms):
+    """Рисует разметку на копии кадра и возвращает её.
+
+    offset — куда смещены координаты пятен относительно кадра: детекция может
+    смотреть маленькую область, а кадр мы сохраняем целиком.
+    """
+    canvas = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
+    off_x, off_y = offset
+
+    for blob in _detect["rejected"]:
+        x1, y1, x2, y2 = blob["bbox"]
+        cv2.rectangle(canvas, (x1 + off_x, y1 + off_y), (x2 + off_x, y2 + off_y),
+                      TUNE_REJECTED_COLOR, 1)
+    for blob in blobs:
+        x1, y1, x2, y2 = blob["bbox"]
+        colour = TUNE_TARGET_COLOR if blob is primary else TUNE_CANDIDATE_COLOR
+        cv2.rectangle(canvas, (x1 + off_x, y1 + off_y), (x2 + off_x, y2 + off_y), colour, 2)
+
+    if region is not None:
+        left, top, width, height = region
+        cv2.rectangle(canvas, (left, top), (left + width, top + height),
+                      TUNE_REGION_COLOR, 1)
+
+    target = None
+    if primary is not None:
+        target = (off_x + primary["center"][0], off_y + primary["center"][1])
+    lines = tune_panel_lines(mode_name, target,
+                             primary["area"] if primary else 0, len(blobs), reaction_ms)
+    for row, text in enumerate(lines):
+        if not text:
+            continue
+        cv2.putText(canvas, text, (12, 26 + row * 17), cv2.FONT_HERSHEY_PLAIN,
+                    1.0, TUNE_TEXT_COLOR, 1, cv2.LINE_AA)
+    return canvas
+
+
+def remember_tune_frame(canvas):
+    """Кладёт размеченный кадр в кольцевой буфер.
+
+    Держим в памяти в JPEG, а не на диске: иначе интересный момент теряется
+    среди сотен кадров в секунду, а так ты досматриваешь до странности и
+    сбрасываешь ровно её.
+    """
+    ok, encoded = cv2.imencode(".jpg", canvas,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), TUNE_JPEG_QUALITY])
+    if not ok:
+        return
+    _tune["frames"].append(encoded.tobytes())
+    limit = max(1, int(cfg.tune_frames))
+    del _tune["frames"][:-limit]
+
+
+def capture_tune_frame(blobs, primary, region, mode_name, reaction_ms):
+    """Снимает весь экран, размечает и кладёт в буфер.
+
+    Снимаем целиком даже в режиме Ctrl, где детекция смотрит только квадрат:
+    по вырезанному квадрату без окружения непонятно, что происходило, а
+    границу области рисуем отдельной рамкой.
+    """
+    if not cfg.tune_mode:
+        return
+    try:
+        whole = {"left": 0, "top": 0, "width": screen_width, "height": screen_height}
+        frame = np.array(main_sct.grab(whole), dtype=np.uint8)
+        canvas = annotate_tune_frame(frame, (region[0], region[1]), blobs, primary,
+                                     region, mode_name, reaction_ms)
+        remember_tune_frame(canvas)
+    except Exception as exc:              # noqa: BLE001 — отладке ронять цикл незачем
+        print(paint("[Отладка]", "red"), f"кадр не снят: {exc}")
+
+
+def dump_tune_frames():
+    """Пишет накопленные кадры на диск, каждый сброс — в свою папку."""
+    frames = list(_tune["frames"])
+    if not frames:
+        print(paint("[Отладка]", "yellow"), "кадров пока нет.")
+        return
+    # отметка времени идёт до секунд, а два сброса подряд укладываются в одну
+    # секунду — тогда дописываем номер, иначе второй затёр бы первый
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    folder = os.path.join(SCRIPT_DIR, TUNE_DIR, stamp)
+    suffix = 2
+    while os.path.exists(folder):
+        folder = os.path.join(SCRIPT_DIR, TUNE_DIR, f"{stamp}-{suffix}")
+        suffix += 1
+    try:
+        os.makedirs(folder)
+        for number, data in enumerate(frames, 1):
+            with open(os.path.join(folder, f"{number:02d}.jpg"), "wb") as handle:
+                handle.write(data)
+    except OSError as exc:
+        print(paint("[Отладка]", "red"), f"не удалось записать: {exc}")
+        return
+    _tune["dumps"] += 1
+    print(paint("[Отладка]", "green"), f"{len(frames)} кадров -> {folder}")
+
+
+def clear_tune_dir():
+    """Стирает всё, что накопилось в папке отладочных кадров."""
+    root = os.path.join(SCRIPT_DIR, TUNE_DIR)
+    if not os.path.isdir(root):
+        print(paint("[Отладка]", "dim"), "папка пуста.")
+        return
+    try:
+        shutil.rmtree(root)
+        print(paint("[Отладка]", "green"), f"содержимое {root} удалено.")
+    except OSError as exc:
+        print(paint("[Отладка]", "red"), f"не удалось удалить: {exc}")
+
+
+def tune_pause_toggle():
+    """Клавиша стоп в отладочном режиме: сперва пауза, потом очистка папки.
+
+    Пауза нужна, чтобы успеть скопировать нужные кадры к себе: повторное
+    нажатие папку стирает. В обычном режиме та же клавиша по-прежнему
+    завершает работу.
+    """
+    if not _tune["paused"]:
+        _tune["paused"] = True
+        print(paint("[Отладка]", "yellow"),
+              f"пауза. Скопируй нужное из {TUNE_DIR}; "
+              f"{cfg.panic_key.upper()} ещё раз — очистить папку и продолжить.")
+        return
+    clear_tune_dir()
+    _tune["paused"] = False
+    print(paint("[Отладка]", "green"), "продолжаю.")
 
 
 # ---------- Конфиг: профили настроек ----------
@@ -2447,8 +2825,12 @@ def console_loop():
                 page("Замер скорости")
                 run_benchmark()
             elif cmd == "window":
-                page("Привязка к окну")
-                print_window_info()
+                if len(parts) > 1 and parts[1].lower() == "pick":
+                    page("Выбор окна")
+                    pick_window()
+                else:
+                    page("Привязка к окну")
+                    print_window_info()
             elif cmd in ("profile", "profiles"):
                 if len(parts) > 1:
                     run_profile_command(parts[1:])
@@ -2543,8 +2925,11 @@ try:
         # можно свернуть, подвинуть или переключиться из него в другое
         viewport = update_aim_context()
 
-        if is_key_held(cfg.track_key):
+        if _tune["paused"]:
+            tracking_key = None       # на паузе ничего не снимаем и не двигаем
+        elif is_key_held(cfg.track_key):
             tracking_key = cfg.track_key.capitalize()
+            _detect["mode"] = "Margin"
             # снимок на итерацию: margin правится из консоли прямо во время работы
             margin = int(cfg.margin)
             cross_x, cross_y = _aim["crosshair"]
@@ -2553,6 +2938,7 @@ try:
             found = track(left, top, width, height, offset_x=left, offset_y=top)
         elif is_key_held(cfg.fullscreen_key):
             tracking_key = cfg.fullscreen_key.capitalize()
+            _detect["mode"] = "Fullscreen"
             # когда игра идёт в окне, незачем разглядывать остальной рабочий стол
             if viewport is None:
                 left, top, width, height = 0, 0, screen_width, screen_height
