@@ -221,6 +221,32 @@ _out_lock = threading.Lock()
 _status = {"width": 0, "shown": False}
 
 
+def clear_screen():
+    """Чистит консоль перед выводом страницы.
+
+    Через ANSI, если консоль его разбирает: быстро и не плодит процесс.
+    Иначе зовём штатную команду — os.system стоит заметно дороже, но
+    срабатывает там, где VT включить не вышло.
+    """
+    if _vt["ok"]:
+        _real_print("\x1b[2J\x1b[3J\x1b[H", end="", flush=True)
+    else:
+        os.system("cls" if os.name == "nt" else "clear")
+
+
+def page(title, subtitle=""):
+    """Шапка страницы — одинаковая у всех разделов."""
+    clear_screen()
+    with _out_lock:
+        _status["shown"] = False      # экран очищен, прежней строки состояния на нём нет
+    width = max(60, min(console_width() - 1, 78))
+    rule = paint("═" * width, "dim")
+    print(rule)
+    print("  " + paint(title.upper(), "bold")
+          + ("   " + paint(subtitle, "dim") if subtitle else ""))
+    print(rule)
+
+
 def console_width():
     return shutil.get_terminal_size((80, 25)).columns
 
@@ -279,16 +305,20 @@ pyautogui.FAILSAFE = True  # двинь мышь в угол экрана, чт�
 pyautogui.PAUSE = 0  # ВАЖНО: по умолчанию pyautogui сам добавляет 0.1с паузы после КАЖДОГО
                      # вызова (moveTo, click...) — это и было основным источником задержки
 
-TRACK_KEY = "ctrl"
-FULLSCREEN_KEY = "alt"
-AUTOCLICK_TOGGLE_KEY = "f6"
-OVERLAY_TOGGLE_KEY = "f7"
-PANIC_KEY = "f8"
+# Боковые кнопки мыши: keyboard их не видит, спрашиваем систему напрямую.
+MOUSE_KEYS = {"mouse4": 0x05, "mouse5": 0x06}      # VK_XBUTTON1 / VK_XBUTTON2
+KEY_SETTINGS = ("track_key", "fullscreen_key", "autoclick_key",
+                "overlay_key", "panic_key", "dump_key")
+
+TUNE_DIR = "tune"
 
 PRIMARY_COLOR = "#00FF00"
 SECONDARY_COLOR = "#FFA500"
+REGION_COLOR = "#00BFFF"
 CROP_PADDING = 15
 MAX_BLOBS_SHOWN = 24
+__version__ = "0.2.0"
+
 FAILSAFE_MARGIN = 2  # на столько пикселей держимся подальше от углов экрана (см. clamp_to_safe_area)
 
 IS_WINDOWS = sys.platform == "win32"
@@ -320,14 +350,25 @@ def require_windows():
 class Config:
     def __init__(self):
         self.aim_mode = "auto"          # auto | absolute | relative (см. move_and_maybe_click)
-        self.window_title = "Minecraft"  # ключевое слово в заголовке окна игры (пусто = не привязываться)
+        self.window_exe = ""            # имя exe окна игры, задаётся через 'window pick'
+        self.window_title = "Minecraft"  # запасной способ: ключевое слово в заголовке
+        self.track_key = "ctrl"         # держать — слежение в области у прицела
+        self.fullscreen_key = "alt"     # держать — слежение по всему окну
+        self.autoclick_key = "f6"       # переключатель автоклика
+        self.overlay_key = "f7"         # переключатель рамки оверлея
+        self.panic_key = "f8"           # аварийная остановка
         self.camera_gain = 0.5          # доля ошибки, проходимая за кадр в относительном режиме
+        self.settle_after_action = 0.05  # сколько не снимать кадры после своего движения/клика, сек
+        self.global_motion_limit = 0.5   # доля изменившегося кадра, выше которой это разворот, а не цель
+        self.click_tolerance = 8        # кликать, только когда цель ближе стольких пикселей к прицелу
         self.margin = 100               # отступ от центра до края области слежения (режим Ctrl), px
         self.scan_interval = 0.005      # пауза между итерациями главного цикла (сек)
         self.diff_threshold = 30        # порог чувствительности разницы пикселей (0-255)
         self.min_blob_area = 4          # мин. площадь пятна в пикселях (отсекает шум)
         self.move_duration = 0.0        # плавность движения мыши (0 = мгновенно, быстрее всего)
         self.hide_settle_delay = 0.02   # пауза после скрытия рамок (только режим с оверлеем)
+        self.box_hold = 0.0             # сколько держать рамки на экране, сек (0 = как раньше)
+        self.margin_preview = 2.0       # сколько показывать квадрат области после смены margin, сек
         self.denoise_kernel = 3         # размер ядра фильтра шума перед поиском пятен (0 = выкл)
         self.lock_radius = 120          # радиус залипания на цель в пикселях (0 = выкл)
         self.lock_timeout = 0.35        # через столько секунд без детекций цель забывается (сек)
@@ -342,6 +383,9 @@ class Config:
         self.autosave = True            # сохранять активный профиль при выходе
         self.bench_on_boot = True       # прогонять бенчмарк один раз за загрузку компьютера
         self.pause_on_start = False      # ждать Enter после вывода настроек, перед слежением
+        self.tune_mode = False          # отладочный режим: разметка блобов и кадры на диск
+        self.tune_frames = 20           # сколько последних кадров держать для сброса
+        self.dump_key = "f9"            # сбросить накопленные кадры на диск
         self.status_hz = 12             # как часто перерисовывать живую строку, раз/с (0 = не рисовать)
         self.color = "auto"             # auto | on | off
 
@@ -421,6 +465,72 @@ TITLE_CACHE_TTL = 0.5
 _window_cache = {"hwnd": 0, "title": "", "ts": 0.0}
 
 
+# EnumWindows хочет функцию по соглашению stdcall; на не-Windows такого типа
+# в ctypes нет, и подставляется обычный — туда мы всё равно не попадаем.
+WNDENUMPROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+MIN_PICKABLE_SIDE = 200          # окна мельче — служебные, в списке только мешают
+
+
+def process_name(hwnd):
+    """Имя исполняемого файла окна.
+
+    Берём именно его, а не заголовок: заголовок переписывают лаунчеры и моды,
+    а exe у игры один и тот же.
+    """
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    pid = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return ""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not handle:
+        return ""
+    try:
+        size = ctypes.c_ulong(260)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buffer.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def list_windows():
+    """Видимые окна, в которые есть смысл целиться: [(hwnd, заголовок, exe, область)].
+
+    Показываем ОКНА, а не процессы: у одной программы процессов бывает
+    несколько, и в диспетчере задач не понять, который из них рисует картинку.
+    """
+    found = []
+
+    def _collect(hwnd, _lparam):
+        if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            return True
+        title = window_text(hwnd)
+        if not title.strip():
+            return True
+        rect = client_rect_on_screen(hwnd)
+        if rect is None or rect[2] < MIN_PICKABLE_SIDE or rect[3] < MIN_PICKABLE_SIDE:
+            return True
+        found.append((hwnd, title, process_name(hwnd), rect))
+        return True
+
+    ctypes.windll.user32.EnumWindows(WNDENUMPROC(_collect), 0)
+    return found
+
+
+def window_matches(title, exe):
+    """Подходит ли окно под текущую привязку."""
+    wanted_exe = cfg.window_exe.strip().lower()
+    if wanted_exe:
+        return exe.lower() == wanted_exe
+    needle = cfg.window_title.strip().lower()
+    return bool(needle) and needle in title.lower()
+
+
 def foreground_window_title():
     """(hwnd, заголовок) активного окна, с кэшем на заголовок.
 
@@ -479,6 +589,7 @@ _aim = {
     "relative": False,
     "last_delta": (0, 0),
     "last_match": None,     # (заголовок, область) последнего найденного окна игры
+    "last_seen": 0.0,       # когда его видели в последний раз
 }
 
 
@@ -492,13 +603,15 @@ def update_aim_context():
     Возвращает область игры или None (обычный рабочий стол).
     """
     viewport = None
-    needle = cfg.window_title.strip().lower()   # ключевое слово, а не весь заголовок
-    if needle:
+    if cfg.window_exe.strip() or cfg.window_title.strip():
         hwnd, title = foreground_window_title()
-        if hwnd and needle in title.lower():
+        # exe спрашиваем только когда он задан: это обращение к чужому процессу
+        exe = process_name(hwnd) if (hwnd and cfg.window_exe.strip()) else ""
+        if hwnd and window_matches(title, exe):
             viewport = client_rect_on_screen(hwnd)
             if viewport is not None:
                 _aim["last_match"] = (title, viewport)
+                _aim["last_seen"] = time.perf_counter()
 
     if viewport is None:
         _aim["crosshair"] = (center_x, center_y)
@@ -572,6 +685,9 @@ class Overlay:
             self.canvas.create_rectangle(-10, -10, -10, -10, outline=SECONDARY_COLOR, width=self.thickness)
             for _ in range(self.max_rects)
         ]
+        # отдельный прямоугольник под область слежения: он не блоб, и цвет у него свой
+        self.region_id = self.canvas.create_rectangle(
+            -10, -10, -10, -10, outline=REGION_COLOR, width=self.thickness)
 
         self.root.update_idletasks()
         self._make_click_through()
@@ -616,7 +732,16 @@ class Overlay:
         def _hide():
             for rect_id in self.rect_ids:
                 self.canvas.coords(rect_id, -10, -10, -10, -10)
+            self.canvas.coords(self.region_id, -10, -10, -10, -10)
         self._run_synced(_hide)
+
+    def show_region_and_wait(self, box):
+        """Рисует границу области слежения — чтобы видеть, куда достаёт детекция."""
+        def _draw():
+            self.canvas.coords(self.region_id, *box)
+        self._run_synced(_draw)
+        with self._shown_lock:
+            self._boxes_shown = True
 
     def show_boxes_and_wait(self, boxes, primary_index=0):
         def _draw():
@@ -754,6 +879,60 @@ def set_overlay_enabled(enabled):
           else "ВЫКЛ — быстрый режим, кадры берутся из фонового потока")
 
 
+def key_is_valid(name):
+    low = name.strip().lower()
+    if low in MOUSE_KEYS:
+        return True
+    try:
+        keyboard.key_to_scan_codes(low)
+        return True
+    except (ValueError, KeyError):
+        return False
+
+
+def is_key_held(name):
+    """Зажата ли клавиша. Понимает и mouse4/mouse5."""
+    low = name.strip().lower()
+    code = MOUSE_KEYS.get(low)
+    if code is not None:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(code) & 0x8000)
+    try:
+        return keyboard.is_pressed(low)
+    except (ValueError, KeyError):
+        return False
+
+
+_hotkeys = []
+
+
+def rebind_hotkeys():
+    """Перевешивает переключатели после смены настроек клавиш.
+
+    Кнопки мыши на переключатели не вешаются: keyboard их не перехватывает,
+    а опрашивать состояние в цикле ради переключателя смысла нет.
+    """
+    global _hotkeys
+    for handle in _hotkeys:
+        try:
+            keyboard.remove_hotkey(handle)
+        except (KeyError, ValueError):
+            pass
+    _hotkeys = []
+    for name, action in ((cfg.autoclick_key, toggle_autoclick),
+                         (cfg.overlay_key, lambda: set_overlay_enabled(not cfg.overlay_enabled)),
+                         (cfg.panic_key, panic_stop),
+                         (cfg.dump_key, dump_tune_frames)):
+        low = name.strip().lower()
+        if low in MOUSE_KEYS:
+            print(paint("[Клавиши]", "yellow"),
+                  f"{name} — кнопка мыши, переключателем быть не может, пропущено")
+            continue
+        try:
+            _hotkeys.append(keyboard.add_hotkey(low, action))
+        except (ValueError, KeyError) as exc:
+            print(paint("[Клавиши]", "yellow"), f"не удалось повесить {name}: {exc}")
+
+
 def toggle_autoclick():
     cfg.auto_click = not cfg.auto_click
     print(paint("[Автоклик]", "cyan"), "включен" if cfg.auto_click else "выключен")
@@ -764,14 +943,18 @@ def panic_stop():
 
     В относительном режиме курсор по экрану не ездит, поэтому угловой failsafe
     у pyautogui там не сработает — эта клавиша его заменяет.
+
+    В отладочном режиме у неё другая роль: пауза, а повторным нажатием —
+    очистка папки с кадрами.
     """
+    if cfg.tune_mode:
+        tune_pause_toggle()
+        return
     _stop.set()
-    print(paint(f"\n[Стоп] Аварийная остановка по {PANIC_KEY.upper()}.", "red"))
+    print(paint(f"\n[Стоп] Аварийная остановка по {cfg.panic_key.upper()}.", "red"))
 
 
-keyboard.add_hotkey(AUTOCLICK_TOGGLE_KEY, toggle_autoclick)
-keyboard.add_hotkey(PANIC_KEY, panic_stop)
-keyboard.add_hotkey(OVERLAY_TOGGLE_KEY, lambda: set_overlay_enabled(not cfg.overlay_enabled))
+
 
 def ask_margin():
     """Спрашивает отступ от центра до края области слежения в режиме Ctrl.
@@ -801,6 +984,23 @@ def ask_margin():
 
 
 # ---------- Детекция ----------
+def is_global_motion(changed_fraction):
+    """Похоже ли, что кадр сменился целиком, а не из-за цели.
+
+    Когда скрипт сам поворачивает камеру, сдвигается вся картинка: меняется
+    почти каждый пиксель, пятен находятся сотни, и скрипт начинает гоняться
+    за собственным разворотом — персонаж крутится без остановки. Окно
+    оседания (settle_after_action) закрывает основной случай, а эта проверка
+    ловит остальное: чужое движение камеры, вспышку, смену сцены.
+    """
+    if cfg.global_motion_limit <= 0 or cfg.global_motion_limit >= 1:
+        return False
+    if changed_fraction <= cfg.global_motion_limit:
+        return False
+    _stat["motion"] = changed_fraction
+    return True
+
+
 def find_blobs_arr(arr1_bgra, arr2_bgra, threshold, min_area, denoise_kernel=0):
     """Ищет пятна изменений между двумя кадрами.
 
@@ -808,6 +1008,10 @@ def find_blobs_arr(arr1_bgra, arr2_bgra, threshold, min_area, denoise_kernel=0):
     трёхканальный срез BGRA-массива не упакован (между пикселями 4 байта при
     трёх каналах), и OpenCV вынужден копировать его целиком. Альфа у mss
     константная, поэтому absdiff по ней всегда 0 и на максимум не влияет.
+
+    Возвращает (пятна, доля изменившихся пикселей). Отсеянные по min_area
+    пятна в отладочном режиме складываются в _detect["rejected"]. Доля нужна, чтобы отличить
+    цель от разворота камеры: при повороте меняется почти весь кадр.
 
     Разница считается через absdiff/max/threshold, то есть в uint8 и на SIMD.
     Прежний np.abs(a.astype(int16) - b.astype(int16)).max(axis=2) аллоцировал
@@ -829,18 +1033,27 @@ def find_blobs_arr(arr1_bgra, arr2_bgra, threshold, min_area, denoise_kernel=0):
     if denoise_kernel > 0:
         kernel = np.ones((denoise_kernel, denoise_kernel), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    changed = cv2.countNonZero(mask) / float(mask.size)
     num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    blobs = []
+    blobs, rejected = [], []
     for label_id in range(1, num_labels):
         x, y, w, h, area = stats[label_id]
         if area < min_area:
+            # в отладочном режиме их рисуют серым: видно, что именно режет порог
+            if cfg.tune_mode:
+                rejected.append({
+                    "bbox": (int(x), int(y), int(x + w), int(y + h)),
+                    "area": int(area),
+                    "center": (int(x + w // 2), int(y + h // 2)),
+                })
             continue
         blobs.append({
             "bbox": (int(x), int(y), int(x + w), int(y + h)),
             "area": int(area),
             "center": (int(x + w // 2), int(y + h // 2)),
         })
-    return blobs
+    _detect["rejected"] = rejected
+    return blobs, changed
 
 
 def clamp_to_safe_area(x, y):
@@ -895,8 +1108,12 @@ def select_target(blobs, offset_x, offset_y):
     return primary
 
 
+# Побочные данные детекции: нужны только отладочному режиму, в боевом пустые.
+_detect = {"rejected": [], "mode": "Margin"}   # mode заполняет главный цикл
+
 # Что показывает живая строка. Заполняется детекцией, читается главным циклом.
-_stat = {"target": None, "blobs": 0, "locked": False, "area": 0, "ms": 0.0}
+_stat = {"target": None, "blobs": 0, "locked": False, "area": 0, "ms": 0.0,
+         "motion": 0.0}
 
 def render_status(key_name):
     """Собирает живую строку как куски (текст, стиль).
@@ -905,6 +1122,10 @@ def render_status(key_name):
     числа, на которые смотрят в первую очередь, когда подбирают настройки.
     """
     way = "SendInput" if _aim["relative"] else "курсор"
+    if _stat["motion"]:
+        return [(f"[{key_name}]", "cyan"),
+                (f" разворот камеры — кадр пропущен ({_stat['motion'] * 100:.0f}% изменилось)",
+                 "yellow")]
     if _stat["target"] is None:
         return [(f"[{key_name}]", "cyan"), (" ищу цель…   ", None),
                 (f"прицел {_aim['crosshair']}   ", "dim"), (way, "dim")]
@@ -920,6 +1141,48 @@ def render_status(key_name):
     parts.append((f"{_stat['ms']:.1f} мс", latency_style(_stat["ms"])))
     parts.append((f"  {way}", "dim"))
     return parts
+
+
+# До этого момента кадрам нельзя верить: мы сами только что дёрнули мышь или
+# кликнули, и картинка ещё меняется от нашего же действия.
+_settle_until = [0.0]
+
+
+# Пока не истекло, рамки остаются на экране, а съёмка не идёт: иначе рамка
+# попала бы в собственный скриншот, а разглядеть её всё равно не успеваешь —
+# при обычном цикле она жила один такт, пару миллисекунд.
+_overlay_hold = [0.0]
+
+
+def hold_overlay(seconds):
+    if seconds > 0:
+        _overlay_hold[0] = max(_overlay_hold[0], time.perf_counter() + seconds)
+
+
+def overlay_is_held():
+    return time.perf_counter() < _overlay_hold[0]
+
+
+def preview_region():
+    """Показывает квадрат области слежения на margin_preview секунд."""
+    if cfg.margin_preview <= 0 or not cfg.overlay_enabled or overlay.error is not None:
+        return
+    margin = int(cfg.margin)
+    cross_x, cross_y = _aim["crosshair"]
+    left, top, width, height = clamp_region(cross_x - margin, cross_y - margin,
+                                            margin * 2, margin * 2)
+    overlay.show_region_and_wait((left, top, left + width, top + height))
+    hold_overlay(cfg.margin_preview)
+
+
+def hold_after_action():
+    """Запрещает съёмку, пока не осядет картинка после нашего действия."""
+    if cfg.settle_after_action > 0:
+        _settle_until[0] = time.perf_counter() + cfg.settle_after_action
+
+
+def frames_are_trustworthy():
+    return time.perf_counter() >= _settle_until[0]
 
 
 _move_remainder = {"x": 0.0, "y": 0.0}
@@ -980,7 +1243,21 @@ def move_relative_to_target(x, y):
     send_relative_mouse_move(dx, dy)
 
 
-_last_click = {"ts": 0.0}
+_last_click = {"ts": time.perf_counter()}   # не 0: иначе первый же клик проходил всегда
+
+
+def target_is_centred(x, y):
+    """Цель уже в прицеле — можно бить.
+
+    Раньше автоклик жал на каждой детекции, в том числе пока камера ещё
+    разворачивалась: удар уходил в воздух, его анимация сама становилась
+    изменением на экране, и клики шли без остановки. Теперь бьём, только
+    когда цель действительно у прицела.
+    """
+    if cfg.click_tolerance <= 0:
+        return True
+    cross_x, cross_y = _aim["crosshair"] if _aim["relative"] else pyautogui.position()
+    return (x - cross_x) ** 2 + (y - cross_y) ** 2 <= cfg.click_tolerance ** 2
 
 
 def click_is_due():
@@ -1001,12 +1278,18 @@ def click_is_due():
 
 def move_and_maybe_click(x, y):
     """Наводит на цель (x, y) в экранных координатах и, если включено, кликает."""
+    # считаем ДО движения: вопрос в том, была ли цель в прицеле, когда мы её увидели
+    aimed = cfg.auto_click and target_is_centred(x, y)
+
     if _aim["relative"]:
         move_relative_to_target(x, y)
     else:
         move_absolute_to_target(x, y)
-    if cfg.auto_click and click_is_due():
+    hold_after_action()
+
+    if aimed and click_is_due():
         pyautogui.click()
+        hold_after_action()      # замах и частицы — тоже наше изменение экрана
 
 
 def aim_log_suffix():
@@ -1029,6 +1312,11 @@ def maybe_save_last_frame(arr_bgr, bbox, region_w, region_h):
 
 def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y):
     """Точный, но медленный режим: рамка синхронно прячется/показывается вокруг захвата."""
+    if overlay_is_held():
+        return False          # рамки ещё показываются, снимать нельзя — попадут в кадр
+    if not frames_are_trustworthy():
+        return False          # ещё не осела картинка после нашего же движения
+
     overlay.hide_all_and_wait(force=True)
     time.sleep(cfg.hide_settle_delay)
 
@@ -1038,10 +1326,11 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
     arr2 = np.array(main_sct.grab(region), dtype=np.uint8)
     t1 = time.perf_counter()
 
-    blobs = find_blobs_arr(arr1, arr2, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
+    blobs, changed = find_blobs_arr(arr1, arr2, cfg.diff_threshold,
+                                    cfg.min_blob_area, cfg.denoise_kernel)
     t2 = time.perf_counter()
 
-    if not blobs:
+    if is_global_motion(changed) or not blobs:
         return False
 
     primary = select_target(blobs, offset_x, offset_y)
@@ -1050,6 +1339,7 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
         for (x1, y1, x2, y2) in (b["bbox"] for b in blobs[:MAX_BLOBS_SHOWN])
     ]
     overlay.show_boxes_and_wait(screen_boxes, primary_index=0)
+    hold_overlay(cfg.box_hold)
     t3 = time.perf_counter()
 
     local_cx, local_cy = primary["center"]
@@ -1057,9 +1347,13 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
     maybe_save_last_frame(arr2, primary["bbox"], region_w, region_h)
     move_and_maybe_click(screen_cx, screen_cy)
     t4 = time.perf_counter()
+    # время меряем ДО разметки и записи: иначе цифра врала бы именно о том,
+    # что этим режимом и настраивают
+    capture_tune_frame(blobs, primary, (region_left, region_top, region_w, region_h),
+                       _detect["mode"], (t4 - t0) * 1000)
 
     _stat.update(target=(screen_cx, screen_cy), blobs=len(blobs), locked=_lock["held"],
-                 area=primary["area"], ms=(t4 - t0) * 1000)
+                 area=primary["area"], ms=(t4 - t0) * 1000, motion=0.0)
 
     if cfg.debug_log:
         print(
@@ -1076,6 +1370,9 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
     """Быстрый режим: без оверлея, кадры уже лежат готовые от фонового FrameGrabber."""
     global _last_used_ts
 
+    if not frames_are_trustworthy():
+        return False          # ещё не осела картинка после нашего же движения
+
     region = (region_left, region_top, region_w, region_h)
     grabber.set_region(region)                 # в режиме Ctrl снимаем только квадрат у центра
     current, ts_now = grabber.get_latest(region)
@@ -1090,10 +1387,11 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
 
     # грабер отдал ровно нужную область — вырезать из кадра больше нечего
     t0 = time.perf_counter()
-    blobs = find_blobs_arr(prev, current, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
+    blobs, changed = find_blobs_arr(prev, current, cfg.diff_threshold,
+                                    cfg.min_blob_area, cfg.denoise_kernel)
     t1 = time.perf_counter()
 
-    if not blobs:
+    if is_global_motion(changed) or not blobs:
         return False
 
     primary = select_target(blobs, offset_x, offset_y)
@@ -1102,9 +1400,11 @@ def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
     maybe_save_last_frame(current, primary["bbox"], region_w, region_h)
     move_and_maybe_click(screen_cx, screen_cy)
     t2 = time.perf_counter()
+    capture_tune_frame(blobs, primary, (region_left, region_top, region_w, region_h),
+                       _detect["mode"], (t2 - t0) * 1000)
 
     _stat.update(target=(screen_cx, screen_cy), blobs=len(blobs), locked=_lock["held"],
-                 area=primary["area"], ms=(t2 - t0) * 1000)
+                 area=primary["area"], ms=(t2 - t0) * 1000, motion=0.0)
 
     if cfg.debug_log:
         print(
@@ -1168,6 +1468,7 @@ def run_benchmark(samples=30):
     def time_diff(h, w):
         a, b = dummy_frame_pair(h, w)
         find_blobs_arr(a, b, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)  # прогрев
+
         t0 = time.perf_counter()
         for _ in range(samples):
             find_blobs_arr(a, b, cfg.diff_threshold, cfg.min_blob_area, cfg.denoise_kernel)
@@ -1176,42 +1477,50 @@ def run_benchmark(samples=30):
     diff_small = time_diff(margin * 2, margin * 2)
     diff_full = time_diff(screen_height, screen_width)
 
+    def ms(value):
+        return paint(f"{value:.1f} мс", latency_style(value))
+
     text = "\n".join([
-        f"  Захват всего экрана ({screen_width}x{screen_height}): {full_avg:.1f} мс",
-        f"  Захват области {margin*2}x{margin*2} (режим Ctrl):    {small_avg:.1f} мс",
-        f"  Поиск пятен на области {margin*2}x{margin*2} (режим Ctrl): {diff_small:.1f} мс",
-        f"  Поиск пятен на всём экране (режим Alt):        {diff_full:.1f} мс",
-        "  Это ориентировочный потолок скорости на твоём железе для этих операций.",
+        f"  Захват всего экрана ({screen_width}x{screen_height}): {ms(full_avg)}",
+        f"  Захват области {margin*2}x{margin*2} (режим Ctrl):    {ms(small_avg)}",
+        f"  Поиск пятен на области {margin*2}x{margin*2} (режим Ctrl): {ms(diff_small)}",
+        f"  Поиск пятен на всём экране (режим Alt):        {ms(diff_full)}",
+        paint(f"  Зелёное укладывается в кадр 60 Гц ({FRAME_BUDGET_MS:.1f} мс), красное — нет.",
+              "dim"),
     ])
     print(text)
     return text
 
 
 # ---------- Консольное управление настройками ----------
+COMMANDS = (
+    ("help", "эта страница: команды и все настройки"),
+    ("help <имя>", "разбор одной настройки целиком"),
+    ("set <имя> <знач>", "изменить настройку"),
+    ("window", "к какому окну привязан прицел и как двигается мышь"),
+    ("window pick", "выбрать окно игры из списка открытых"),
+    ("bench", "замерить скорость захвата и детекции"),
+    ("profile", "профили настроек: список и управление"),
+    ("reset_config", "стереть файл конфига (спросит подтверждение)"),
+)
+
+
 def print_help():
-    print(
-        "\nКоманды консоли:\n"
-        "  edit                         — меню всех переменных: значения, границы, описания\n"
-        "  show                         — то же самое, но коротким списком\n"
-        "  set <имя> <значение>         — изменить переменную\n"
-        "  set <имя>                    — показать одну переменную с описанием\n"
-        "  log on|off                   — подробный лог каждой детекции (по умолчанию выкл)\n"
-        "  overlay on|off               — вкл/выкл рамку (F7 делает то же самое)\n"
-        "  click on|off                 — вкл/выкл автоклик (F6 делает то же самое)\n"
-        "  save on|off                  — сохранять last.jpg при детекции (тратит время!)\n"
-        "  window                       — к какому окну привязан прицел и как двигаем мышь\n"
-        "  bench                        — замерить скорость захвата/детекции сейчас\n"
-        "  profiles                     — страница профилей: список и команды\n"
-        "  profile save|load|delete|default|defaults\n"
-        "  reset_config                 — стереть файл конфига (спросит подтверждение)\n"
-        "  help                         — эта справка\n"
-        "\nПодробные объяснения:\n"
-        "  help <тема>                  — " + ", ".join(HELP_TOPICS) + "\n"
-        "  set <имя>                    — разбор одной настройки целиком\n"
-    )
+    """Одна страница вместо прежних help, edit и show.
+
+    Три команды показывали по сути одно и то же разными способами, а вдобавок
+    были log/overlay/click/save — каждая дублировала обычный set. Теперь
+    список команд и таблица настроек живут на одной странице.
+    """
+    page("AimTracker", f"v{__version__}")
+    print()
+    for name, what in COMMANDS:
+        print(f"  {paint(name.ljust(18), 'cyan')} {what}")
+    print_settings_menu()
 
 
 BOOL_TRUE = {"1", "on", "true", "yes", "да"}
+
 BOOL_FALSE = {"0", "off", "false", "no", "нет"}
 
 # нижние границы для настроек, которые иначе уронят cv2 (отрицательное ядро и т.п.)
@@ -1230,6 +1539,12 @@ MIN_VALUES = {
     "camera_gain": 0.01,
     "click_interval": 0.0,
     "status_hz": 0,
+    "tune_frames": 1,
+    "box_hold": 0.0,
+    "margin_preview": 0.0,
+    "settle_after_action": 0.0,
+    "global_motion_limit": 0.0,
+    "click_tolerance": 0,
 }
 
 # значения-строки: что вообще можно вписать
@@ -1244,6 +1559,7 @@ MAX_VALUES = {
     "margin": min(center_x, center_y),   # больше — область слежения вылезет за край экрана
     "camera_gain": 5.0,
     "status_hz": 60,
+    "global_motion_limit": 1.0,
 }
 
 
@@ -1269,6 +1585,11 @@ def coerce_setting(name, raw):
         return parse_bool(raw) if isinstance(raw, str) else bool(raw)
     if isinstance(current, str):
         value = str(raw).strip()
+        if name in KEY_SETTINGS:
+            if not key_is_valid(value):
+                raise ValueError(f"{value!r} — неизвестная клавиша "
+                                 f"(примеры: ctrl, alt, f9, x, mouse4)")
+            return value.lower()
         allowed = ALLOWED_VALUES.get(name)
         if allowed is None:
             return value                   # свободный текст, например заголовок окна
@@ -1297,8 +1618,12 @@ def assign_setting(name, value):
     """
     if name == "overlay_enabled":
         set_overlay_enabled(value)
-    else:
-        setattr(cfg, name, value)
+        return
+    setattr(cfg, name, value)
+    if name in KEY_SETTINGS:
+        rebind_hotkeys()        # переключатели должны переехать на новую клавишу
+    if name == "margin":
+        preview_region()        # наглядно, куда теперь достаёт детекция
 
 
 def apply_setting(name, raw):
@@ -1308,15 +1633,15 @@ def apply_setting(name, raw):
     try:
         value = coerce_setting(name, raw)
     except ValueError as exc:
-        print(f"Не могу разобрать значение для {name}: {exc}")
+        print(paint("не принято:", "red"), f"{name} — {exc}")
         return
     error = bounds_error(name, value)
     if error:
-        print(error)
+        print(paint("не принято:", "red"), error)
         return
     assign_setting(name, value)
     if name != "overlay_enabled":          # сеттер печатает своё сообщение
-        print(f"{name} = {format_value(value)}")
+        print(paint("изменено:", "green"), f"{name} = {format_value(value)}")
 
 
 # Описания переменных для меню 'edit'. Порядок групп — порядок вывода.
@@ -1327,10 +1652,20 @@ SETTINGS_GROUPS = [
         ("min_blob_area",     "минимальная площадь пятна, px: всё мельче отбрасывается"),
         ("denoise_kernel",    "ядро фильтра точечного шума перед поиском пятен, px (0 = выкл)"),
     )),
+    ("Клавиши", (
+        ("track_key",         "держать для слежения в области у прицела"),
+        ("fullscreen_key",    "держать для слежения по всему окну игры"),
+        ("autoclick_key",     "переключатель автоклика"),
+        ("overlay_key",       "переключатель рамки оверлея"),
+        ("panic_key",         "аварийная остановка"),
+    )),
     ("Прицел в игре", (
         ("aim_mode",          "auto = относительное движение, когда активно окно игры, иначе абсолютное"),
-        ("window_title",      "ключевое слово в заголовке окна игры; пусто — не привязываться к окну"),
+        ("window_exe",        "имя exe окна игры; задаётся командой 'window pick'"),
+        ("window_title",       "запасной способ: ключевое слово в заголовке окна"),
         ("camera_gain",       "доля ошибки за кадр в относительном режиме: больше — резче, но с перелётом"),
+        ("settle_after_action", "сколько не снимать кадры после своего движения или клика, сек"),
+        ("global_motion_limit", "доля изменившегося кадра, выше которой это разворот камеры, а не цель"),
     )),
     ("Прицел на рабочем столе", (
         ("lock_radius",       "радиус залипания на прежнюю цель, px (0 = выкл, всегда крупнейшее пятно)"),
@@ -1342,16 +1677,24 @@ SETTINGS_GROUPS = [
     ("Скорость", (
         ("scan_interval",     "пауза между итерациями главного цикла, сек"),
         ("hide_settle_delay", "пауза после скрытия рамок перед захватом, сек (только режим с оверлеем)"),
+        ("box_hold",          "сколько держать рамки на экране, сек: 0 = мелькают один такт"),
+        ("margin_preview",    "сколько показывать квадрат области после смены margin, сек"),
     )),
     ("Режимы и вывод", (
         ("overlay_enabled",   "рамка оверлея: on = точнее и медленнее, off = быстрый режим (F7)"),
         ("auto_click",        "кликать после наведения (F6)"),
         ("click_interval",    "минимальная пауза между кликами, сек: 0 = на каждой детекции"),
+        ("click_tolerance",   "кликать, только когда цель ближе стольких пикселей к прицелу"),
         ("debug_log",         "подробный таймлог на каждую детекцию; обычно хватает строки состояния"),
+        ("status_hz",         "как часто перерисовывать живую строку, раз/с (0 = не рисовать)"),
+        ("color",             "цвет в выводе: auto подстраивается под терминал"),
         ("save_last_frame",   "сохранять last.jpg при детекции — запись на диск добавляет задержку"),
         ("autosave",          "сохранять активный профиль при выходе"),
         ("bench_on_boot",     "гонять бенчмарк один раз за загрузку компьютера, а не каждый старт"),
         ("pause_on_start",    "ждать Enter перед началом слежения, чтобы успеть прочитать вывод"),
+        ("tune_mode",         "отладочный режим: разметка блобов и кадры на диск"),
+        ("tune_frames",       "сколько последних размеченных кадров держать для сброса"),
+        ("dump_key",          "клавиша сброса накопленных кадров на диск"),
     )),
 ]
 
@@ -1400,16 +1743,19 @@ def print_settings_menu():
     значением и границами выходило под 130 символов, и хвосты уезжали за
     край обычного окна консоли.
     """
-    print("\nНастраиваемые переменные. 'set <имя> <значение>' — изменить,")
-    print("'set <имя>' — показать одну с описанием.")
+    print("\n  " + paint("НАСТРОЙКИ", "bold")
+          + paint("   имя · значение · допустимое", "dim"))
     wrap = max(40, min(console_width() - 1, 78)) - 8
+    # ширина колонки от самого длинного имени: при зашитой 18 настройки вроде
+    # settle_after_action выходили за неё и сдвигали колонку значений
+    name_width = max(len(n) for n in vars(cfg)) + 2
     for title, items in settings_groups_full():
         print("\n  " + paint(title.upper(), "bold"))
         for name, desc in items:
             value = getattr(cfg, name)
             hint = range_hint(name, value)
             # ljust до paint: иначе ширину считали бы вместе с невидимыми кодами
-            print(f"    {name:<18}{paint(format_value(value).ljust(14), 'green')}"
+            print(f"    {name:<{name_width}}{paint(format_value(value).ljust(14), 'green')}"
                   f"{paint(hint, 'dim')}")
             for line in textwrap.wrap(desc, wrap) or [""]:
                 print(f"        {line}")
@@ -1556,6 +1902,276 @@ on — красить через силу. Пригодится, если тер
 
 off — никогда. На скорость цвет не влияет.""",
 
+    "box_hold": """\
+Сколько секунд держать рамки найденных пятен на экране. 0 — прежнее
+поведение.
+
+При нуле рамка живёт ровно один такт цикла — на обычных настройках это пара
+миллисекунд, и разглядеть её невозможно. Дольше держать нельзя просто так:
+пока рамка на экране, снимать кадры запрещено, иначе она попадёт в
+собственный скриншот, будет засчитана за изменение и начнёт разрастаться.
+Поэтому удержание рамок ПРИОСТАНАВЛИВАЕТ детекцию на это время.
+
+Для настройки ставь 0.3-0.5 и смотри, что скрипт считает целью. Для работы
+возвращай 0.""",
+
+    "margin_preview": """\
+Сколько секунд показывать голубой квадрат области слежения после смены
+margin. 0 — не показывать.
+
+Нужно, чтобы видеть глазами, куда достаёт детекция в режиме Ctrl, а не
+прикидывать по числу. Как и box_hold, на это время приостанавливает
+детекцию: квадрат тоже нельзя снимать вместе с экраном.""",
+
+
+    "window_exe": """\
+Имя исполняемого файла окна игры, например javaw.exe. Пусто — искать по
+заголовку (window_title).
+
+Задаётся командой window pick: она показывает открытые окна списком, и ты
+выбираешь номером. Лезть в диспетчер задач не нужно — и это важно, потому
+что там видны ПРОЦЕССЫ, а у одной программы их бывает несколько, и какой из
+них рисует картинку, по списку процессов не понять.
+
+Имя exe надёжнее заголовка: заголовок переписывают лаунчеры и моды, а exe
+у игры один и тот же. Если exe задан, window_title не используется.""",
+
+    "window_title": """\
+Ключевое слово, по которому ищется окно игры. Пусто — не привязываться к
+окну вообще, тогда прицел считается центром экрана.
+
+Это именно подстрока, а не полный заголовок: "Minecraft" подойдёт к
+"Minecraft* 1.20.1 - Singleplayer". Лаунчеры и моды часто дописывают к
+заголовку своё, поэтому бери короткий кусок, который точно не меняется.
+
+Ищется только среди АКТИВНЫХ окон: целиться в неактивную игру бессмысленно,
+а перебор всех окон давал бы ложные совпадения — браузер со словом Minecraft
+во вкладке, папка с таким именем. Команда window покажет, что нашлось.""",
+
+    "fullscreen_key": """\
+Клавиша, которую держат для слежения по всему окну игры.
+
+В отличие от track_key, область не ограничена квадратом вокруг прицела:
+смотрится весь игровой кадр. Детекция от этого заметно дороже, зато цель не
+теряется, уйдя за край маленькой области.
+
+Принимает имена клавиш и боковые кнопки мыши (mouse4, mouse5). Про конфликты
+с игровыми биндами — см. help track_key.""",
+
+    "autoclick_key": """\
+Клавиша-переключатель автоклика.
+
+Это переключатель, а не удержание: нажал — включилось, нажал ещё раз —
+выключилось. Кнопки мыши сюда повесить нельзя, только клавиатуру.""",
+
+    "overlay_key": """\
+Клавиша-переключатель рамки оверлея, то есть способа захвата экрана.
+Подробно про сами режимы — help overlay_enabled.
+
+Переключатель, кнопки мыши не принимает.""",
+
+    "panic_key": """\
+Аварийная остановка: скрипт завершает работу.
+
+Нужна отдельно, потому что штатный тормоз pyautogui — увести курсор в угол
+экрана — в игре не работает: там курсор по экрану не ездит, мышь двигается
+относительными смещениями. Если наводка сошла с ума, это единственный
+быстрый способ её прекратить.""",
+
+    "scan_interval": """\
+Пауза между итерациями главного цикла, в секундах.
+
+Без паузы цикл сожрал бы ядро процессора целиком, ничего не выигрывая:
+узкое место — захват экрана, а не скорость опроса. 0.005 — это 200 проверок
+в секунду, чего с запасом хватает при мониторе 60 Гц.
+
+Увеличивать имеет смысл, только если скрипт мешает самой игре.""",
+
+    "min_blob_area": """\
+Минимальная площадь пятна в пикселях. Всё мельче отбрасывается.
+
+Работает в паре с diff_threshold и denoise_kernel, но по-другому: порог
+решает, СЧИТАЕТСЯ ли пиксель изменившимся, фильтр убирает одиночные шумные
+точки, а эта настройка отсекает уже собранные пятна по размеру.
+
+Поднимать, когда скрипт цепляется за мелочь вроде отдельных частиц.
+Опускать, если теряет настоящую, но далёкую (а значит мелкую) цель.""",
+
+    "move_duration": """\
+Длительность самого движения мыши в absolute-режиме, в секундах.
+0 — мгновенный перенос курсора.
+
+Это не сглаживание: pyautogui растягивает ОДИН вызов moveTo на это время,
+блокируя цикл. Для плавности есть move_smoothing, который делит путь на
+кадры и ничего не блокирует. Держи здесь 0, если нет причины иначе.""",
+
+    "hide_settle_delay": """\
+Пауза после скрытия рамок перед захватом кадра, в секундах. Только для
+режима с рамкой.
+
+Рамку прячет поток tkinter, и возврат из функции не значит, что окно уже
+перерисовалось. Если снять кадр слишком рано, рамка попадёт в скриншот,
+будет засчитана за изменение и начнёт разрастаться. Эта пауза — страховка
+на случай, если система не успевает.
+
+Если рамки в кадр не попадают, можно пробовать уменьшать: это чистая
+прибавка к задержке.""",
+
+    "lock_timeout": """\
+Через сколько секунд без детекций прежняя цель забывается.
+
+Работает с lock_radius: пока цель "жива", скрипт держится за неё, а не за
+самое крупное пятно. Этот таймер решает, когда считать её потерянной.
+
+Больше — упорнее держится за цель, пережидая паузы в движении. Меньше —
+быстрее переключается на новое.""",
+
+    "dead_zone": """\
+Не двигать мышь, если цель ближе стольких пикселей.
+
+Гасит микродёрганье, когда цель уже практически в прицеле: без этого
+наводка бесконечно подправляет себя на один-два пикселя, и на записи
+курсор мелко дрожит.
+
+Не путать с click_tolerance: эта настройка про ДВИЖЕНИЕ, та — про клик.""",
+
+    "debug_log": """\
+Печатать подробную строку на каждую детекцию: сколько пятен, площадь цели,
+разбивка времени по этапам.
+
+По умолчанию выключено, потому что детекция идёт сотни раз в секунду и лог
+заливает консоль так, что работать в ней невозможно. Обычная обратная связь
+— живая строка состояния, которая перерисовывается на месте.
+
+Включать, когда надо увидеть, на что именно уходит время.""",
+
+    "save_last_frame": """\
+Сохранять last.jpg с вырезанной целью при каждой детекции.
+
+Запись на диск происходит внутри цикла реакции и стоит заметного времени,
+поэтому по умолчанию выключено. Для разбора того, что видит скрипт, лучше
+подходит отладочный режим — он пишет кадры целиком и с разметкой.""",
+
+    "auto_click": """\
+Кликать после наведения. Переключается и клавишей (autoclick_key).
+
+Клик проходит, только когда цель уже в прицеле (click_tolerance) и с
+момента прошлого прошло не меньше click_interval. Без этих двух проверок
+автоклик входил в самоподдерживающийся цикл: удар по воздуху менял картинку,
+изменение засчитывалось за цель, следовал новый удар.""",
+
+    "autosave": """\
+Сохранять активный профиль при выходе.
+
+Чтобы подобранное за сессию не пропало. Не срабатывает после
+'profile defaults' и 'reset_config': там ты осознанно сбросил настройки, и
+сохранение затёрло бы профиль дефолтами или воскресило удалённый файл.""",
+
+    "bench_on_boot": """\
+Прогонять замер скорости один раз за загрузку компьютера, а не при каждом
+запуске.
+
+Результат сохраняется в конфиг вместе с меткой загрузки системы; следующие
+запуски до перезагрузки показывают сохранённые цифры. Выключи, если замер
+мешает; перемерить вручную всегда можно командой bench.""",
+
+    "tune_mode": """\
+Отладочный режим для подбора настроек. Выключен по умолчанию.
+
+Каждая детекция снимает ВЕСЬ экран, размечает его и кладёт в кольцевой
+буфер последних tune_frames кадров. Разметка:
+
+  зелёный  — цель, на которую пойдёт курсор
+  жёлтый   — прошли порог площади, но не выбраны
+  серый    — отсеяны min_blob_area
+  голубой  — граница области слежения
+
+В углу панель: версия, режим, размеры экрана и три главных порога, а ниже
+координаты цели, её площадь, число пятен и время реакции. Время меряется
+ДО разметки и записи — иначе цифра врала бы именно о том, что ты
+настраиваешь.
+
+Клавиша dump_key пишет буфер на диск, каждый сброс в свою папку внутри
+tune/. Клавиша остановки в этом режиме не завершает работу, а ставит паузу:
+успеваешь скопировать нужные кадры, повторное нажатие стирает папку и
+продолжает.
+
+Режим заведомо медленнее боевого: съёмка всего экрана, отрисовка и
+кодирование стоят десятков миллисекунд на кадр.""",
+
+    "tune_frames": """\
+Сколько последних размеченных кадров держать в памяти для сброса на диск.
+
+Хранятся сжатыми в JPEG, два десятка кадров — это порядка десятка мегабайт.
+Больше значение — длиннее история перед интересным моментом, но и памяти
+больше.""",
+
+    "dump_key": """\
+Клавиша, которая пишет накопленные отладочные кадры на диск.
+
+Каждое нажатие создаёт внутри tune/ папку с отметкой времени, так что
+предыдущие сбросы не затираются. Работает только в отладочном режиме —
+в боевом буфер не наполняется.""",
+
+    "pause_on_start": """\
+Ждать Enter после стартового вывода, перед началом слежения.
+
+Нужно, если запускаешь двойным кликом и не успеваешь прочитать, что скрипт
+написал о конфиге, окне и замерах.""",
+
+    "settle_after_action": """\
+Сколько не доверять кадрам после собственного движения мыши или клика,
+в секундах. 0 — проверка выключена.
+
+Когда скрипт поворачивает камеру, на экране сдвигается ВСЁ. Если снять кадр
+в этот момент, разницы будут везде, скрипт найдёт "цели" по всему экрану и
+довернёт ещё сильнее — персонаж начинает крутиться без остановки. Клик даёт
+то же самое в меньшем масштабе: анимация замаха сама становится изменением
+экрана, и автоклик уходит в самоподдерживающийся цикл.
+
+Поэтому после каждого своего действия скрипт пережидает, пока картинка
+осядет. При мониторе 60 Гц один кадр — 16.6 мс, так что осмысленные значения
+начинаются примерно с 0.03. Больше значение — надёжнее, но реже наводка.""",
+
+    "global_motion_limit": """\
+Доля изменившегося кадра, выше которой изменение считается разворотом
+камеры, а не целью. От 0 до 1, 0 — проверка выключена.
+
+Это страховка к settle_after_action. Окно оседания закрывает наши
+собственные движения, а эта проверка ловит остальное: ты сам крутанул мышью,
+сменилась сцена, рвануло взрывом. При повороте камеры меняется почти каждый
+пиксель, у настоящей цели — доли процента.
+
+0.5 значит "больше половины экрана". Ставить сильно ниже опасно: на людной
+сцене настоящие изменения тоже бывают обширными, и порог начнёт глотать
+полезные детекции.""",
+
+    "click_tolerance": """\
+Кликать, только когда цель уже ближе стольких пикселей к прицелу.
+0 — бить на каждой детекции, как раньше.
+
+Раньше автоклик жал в тот же момент, когда скрипт только НАЧИНАЛ
+разворачиваться к цели. Удар уходил в воздух, а его анимация становилась
+новым изменением на экране, которое скрипт принимал за цель — и клики шли
+без остановки.
+
+Значение подбирается под размер цели на экране: слишком мало — будешь
+ждать идеального наведения и пропускать, слишком много — вернёшься к ударам
+в воздух.""",
+
+    "track_key": """\
+Клавиша, которую надо держать для слежения в области у прицела.
+
+Принимает имена клавиш (ctrl, alt, shift, f9, x) и боковые кнопки мыши
+(mouse4, mouse5).
+
+Про конфликты: по умолчанию стоит ctrl, а в играх он часто забинден на
+присед. Тогда при каждом нажатии персонаж садится, экран меняется, и скрипт
+принимает это за цель. Если у тебя так — перевесь на то, что в игре не
+занято. Боковая кнопка мыши для этого удобнее всего: держать её во время
+прицеливания естественно, и с игровыми биндами она почти никогда не
+спорит.""",
+
     "click_interval": """\
 Минимальная пауза между автокликами, в секундах. 0 — кликать на каждой
 детекции.
@@ -1574,68 +2190,6 @@ off — никогда. На скорость цвет не влияет.""",
 Режим Alt смотрит всё окно игры целиком и этой настройкой не ограничен.""",
 }
 
-# Темы для 'help <тема>': то, что не привязано к одной настройке.
-HELP_TOPICS = {
-    "режимы": ("Режимы захвата экрана", SETTINGS_HELP["overlay_enabled"]),
-    "прицел": ("Как скрипт наводит мышь", SETTINGS_HELP["aim_mode"]),
-    "детекция": ("Как находится цель", """\
-Скрипт не понимает, что на экране. Он снимает два кадра подряд и ищет, что
-между ними изменилось — поэтому и работает по частицам от разрушенного
-блока, по летящим предметам, по любому движению.
-
-Что происходит за один цикл:
-
-1. Два снимка области (по Ctrl — квадрат margin вокруг прицела, по Alt — всё
-   окно игры).
-2. Поиск разницы по каждому пикселю; всё, что изменилось сильнее
-   diff_threshold, попадает в маску.
-3. denoise_kernel убирает из маски точечный шум.
-4. Маска делится на связные области — "пятна". Пятна мельче min_blob_area
-   отбрасываются.
-5. Из оставшихся выбирается цель: самое крупное пятно, либо то, за которое
-   держит залипание (lock_radius).
-6. Мышь доворачивается к центру цели.
-
-Если целью становится не то, что нужно, крути именно в этом порядке:
-diff_threshold, потом denoise_kernel, потом min_blob_area. Включи рамку
-(F7), чтобы видеть, что скрипт считает пятнами: зелёная — выбранная цель,
-оранжевые — остальные."""),
-    "профили": ("Профили настроек", """\
-Настройки хранятся в aim_config.json рядом со скриптом, наборами под разные
-сцены — у воды и у разрушенного блока разный шум, и пороги к ним нужны
-разные.
-
-  profiles               список: что сохранено, что активно, что грузится
-  profile save <имя>     сохранить текущие настройки под этим именем
-  profile load <имя>     загрузить
-  profile default <имя>  какой профиль брать при запуске
-  profile delete <имя>   удалить (спросит подтверждение)
-  profile defaults       вернуть встроенные значения из кода
-  reset_config           стереть файл целиком (спросит подтверждение)
-
-Встроенные значения живут в самом коде, не в файле. Поэтому скрипт
-запускается и без конфига, а 'profile defaults' всегда может вернуть
-заведомо рабочий набор.
-
-При выходе активный профиль сохраняется сам (настройка autosave). После
-'profile defaults' и 'reset_config' — не сохраняется, иначе выход затёр бы
-то, что ты только что осознанно сбросил."""),
-    "скорость": ("Откуда берётся задержка", """\
-Реакция складывается из захвата экрана, поиска пятен и движения мыши.
-Команда 'bench' меряет первые два на твоём железе.
-
-Обычно почти всё время уходит на захват: вызов снимка экрана стоит
-фиксированно, почти независимо от размера области. Поиск пятен после
-перехода на OpenCV занимает доли миллисекунды на небольшой области.
-
-Важный предел: при мониторе 60 Гц между двумя РАЗНЫМИ кадрами проходит
-16.6 мс, и быстрее этого реагировать физически не на что — новой картинки
-просто ещё нет. Задержка в живой строке красится по этому порогу: зелёная —
-с запасом, жёлтая — ещё успеваем, красная — в кадр не уложились.
-
-Что реально помогает: выключить рамку (F7), уменьшить margin, поднять
-denoise_kernel на шумной сцене, уменьшить status_hz."""),
-}
 
 
 LIST_ITEM = re.compile(r"^(\s*)((?:\d+\.|[-*])\s+)(.*)$")
@@ -1686,14 +2240,57 @@ def _join_list_items(lines):
     return items
 
 
-def print_topic_help(name):
-    key = name.strip().lower()
-    if key not in HELP_TOPICS:
-        print(f"Нет такой темы: {name}. Доступны: {', '.join(HELP_TOPICS)}")
+def pick_window():
+    """Показывает список открытых окон и даёт выбрать нужное номером.
+
+    Так не приходится лезть в диспетчер задач и гадать, какой из процессов
+    игры рисует картинку. Запоминается имя exe: оно переживает смену
+    заголовка лаунчером или модом.
+    """
+    try:
+        windows = list_windows()
+    except Exception as exc:              # noqa: BLE001 — выбору падать незачем
+        print(paint("[Окно]", "red"), f"не удалось перечислить окна: {exc}")
         return
-    title, text = HELP_TOPICS[key]
-    print("\n  " + paint(title.upper(), "bold"))
-    wrap_help(text, "  ")
+    if not windows:
+        print(paint("[Окно]", "yellow"), "подходящих окон не найдено.")
+        return
+
+    print()
+    for number, (_hwnd, title, exe, (left, top, width, height)) in enumerate(windows, 1):
+        short = title if len(title) <= 42 else title[:41] + "…"
+        print(f"  {paint(str(number).rjust(2), 'cyan')}  {short:<43}"
+              f"{paint(exe or '?', 'green'):<22}{paint(f'{width}x{height}', 'dim')}")
+    print(f"\n  {paint('0', 'cyan')}   не привязываться к окну (прицел в центре экрана)")
+
+    try:
+        answer = input("\n  Номер окна: ").strip()
+    except EOFError:
+        return
+    if not answer.isdigit() or not 0 <= int(answer) <= len(windows):
+        print(paint("[Окно]", "yellow"), "не понял номер, ничего не меняю.")
+        return
+
+    choice = int(answer)
+    if choice == 0:
+        cfg.window_exe = ""
+        cfg.window_title = ""
+        print(paint("[Окно]", "green"), "привязка снята, прицел в центре экрана.")
+        return
+
+    _hwnd, title, exe, _rect = windows[choice - 1]
+    if exe:
+        cfg.window_exe = exe
+        cfg.window_title = ""
+        print(paint("[Окно]", "green"), f"привязано к {exe}")
+    else:
+        # имя процесса не отдалось (бывает с окнами от системы) — остаётся заголовок
+        cfg.window_exe = ""
+        cfg.window_title = title.split()[0] if title.split() else title
+        print(paint("[Окно]", "yellow"),
+              f"имя процесса недоступно, привязываюсь по слову {cfg.window_title!r}")
+    _window_cache["ts"] = 0.0
+    update_aim_context()
 
 
 def print_window_info():
@@ -1703,35 +2300,200 @@ def print_window_info():
     команду в консоли, активна именно консоль, так что первое почти всегда
     будет "не совпадает" — смотреть надо на второе.
     """
-    try:
-        hwnd, title = foreground_window_title()
-    except Exception as exc:               # noqa: BLE001 — диагностике падать незачем
-        print(f"[Окно] Не удалось опросить активное окно: {exc}")
-        return
-
-    needle = cfg.window_title.strip()
-    matched = bool(needle) and needle.lower() in title.lower()
-    print(f"\n  Ключевое слово:  {needle!r}")
-    print(f"  Активно сейчас:  {title!r}  ->  {'совпадает' if matched else 'не совпадает'}")
+    if cfg.window_exe.strip():
+        print(f"\n  Привязка по exe: {paint(cfg.window_exe, 'green')}")
+    elif cfg.window_title.strip():
+        print(f"\n  Ключевое слово:  {cfg.window_title!r}")
+    else:
+        print("\n  " + paint("Привязки нет: прицел считается центром экрана.", "yellow"))
+    print(f"  {paint('window pick', 'cyan')} — выбрать окно из списка")
 
     last = _aim["last_match"]
     if last is None:
-        print("  Окно игры ещё ни разу не попадалось.")
+        print("  " + paint("Окно игры ещё ни разу не попадалось.", "yellow"))
         print(f"  Прицел: центр экрана ({center_x}, {center_y}).")
     else:
+        # Активное сейчас окно не показываем: пока набираешь команду, активна
+        # консоль, и ответ был бы всегда один и тот же. Смысл несёт последнее
+        # совпадение и то, насколько оно свежее.
         last_title, (left, top, width, height) = last
-        print(f"  Последнее совпавшее: {last_title!r}")
-        print(f"    клиентская область {width}x{height} в точке ({left}, {top})")
-        print(f"    прицел ({left + width // 2}, {top + height // 2})")
+        ago = time.perf_counter() - _aim["last_seen"]
+        when = "прямо сейчас" if ago < 1.5 else f"{ago:.0f} с назад"
+        print(f"  Привязано к:     {last_title!r}")
+        print(f"  Видели:          {when}")
+        print(f"  Область игры:    {width}x{height} в точке ({left}, {top})")
+        print(f"  Прицел:          ({left + width // 2}, {top + height // 2})")
 
     way = "относительное (SendInput)" if _aim["relative"] else "абсолютное (SetCursorPos)"
-    print(f"  aim_mode={cfg.aim_mode} -> сейчас движение {way}")
-    print("  Абсолютное движение игра с raw input не увидит.\n")
+    print(f"  Движение мыши:   {way}   (aim_mode={cfg.aim_mode})")
+    print("  " + paint("Абсолютное движение игра с raw input не увидит.", "dim") + "\n")
 
 
-def print_settings():
-    for name, value in vars(cfg).items():
-        print(f"  {name} = {format_value(value)}")
+
+
+# ---------- Отладочный режим ----------
+# Разметка идёт прямо на кадре через OpenCV, а не оверлеем: кадр уже в памяти,
+# подписи латиницей (cv2.putText кириллицу не умеет), и результат — файл,
+# который можно разглядывать сколько угодно, в отличие от мелькнувшей рамки.
+
+TUNE_TARGET_COLOR = (0, 255, 0)        # BGR: цель
+TUNE_CANDIDATE_COLOR = (0, 255, 255)   # подходящие, но не выбранные
+TUNE_REJECTED_COLOR = (180, 180, 180)  # отсеянные по min_blob_area
+TUNE_REGION_COLOR = (255, 191, 0)      # граница области слежения
+TUNE_TEXT_COLOR = (0, 0, 255)
+TUNE_JPEG_QUALITY = 80
+
+_tune = {"frames": [], "paused": False, "dumps": 0}
+
+
+def tune_panel_lines(mode_name, target, area, blobs, reaction_ms):
+    """Строки отладочной панели. Только латиница: cv2.putText иначе не нарисует."""
+    aim_way = "relative" if _aim["relative"] else "absolute"
+    lines = [
+        f"AimAssist Ver. {__version__} - {mode_name} - {aim_way}",
+        "",
+        f"Screen - {screen_width}x{screen_height}",
+        f"margin - {int(cfg.margin)}px",
+        f"diff_threshold - {cfg.diff_threshold}",
+        f"min_blob_area - {cfg.min_blob_area}",
+        f"denoise_kernel - {cfg.denoise_kernel}",
+        "",
+        "Detection",
+        f"Target - {target[0]},{target[1]}" if target else "Target - none",
+        f"Area - {area} px",
+        f"Blobs - {blobs}" + (f" (+{len(_detect['rejected'])} ignored)"
+                              if _detect["rejected"] else ""),
+        f"Reaction Time - {reaction_ms:.1f} ms",
+    ]
+    return lines
+
+
+def annotate_tune_frame(frame_bgra, offset, blobs, primary, region, mode_name, reaction_ms):
+    """Рисует разметку на копии кадра и возвращает её.
+
+    offset — куда смещены координаты пятен относительно кадра: детекция может
+    смотреть маленькую область, а кадр мы сохраняем целиком.
+    """
+    canvas = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
+    off_x, off_y = offset
+
+    for blob in _detect["rejected"]:
+        x1, y1, x2, y2 = blob["bbox"]
+        cv2.rectangle(canvas, (x1 + off_x, y1 + off_y), (x2 + off_x, y2 + off_y),
+                      TUNE_REJECTED_COLOR, 1)
+    for blob in blobs:
+        x1, y1, x2, y2 = blob["bbox"]
+        colour = TUNE_TARGET_COLOR if blob is primary else TUNE_CANDIDATE_COLOR
+        cv2.rectangle(canvas, (x1 + off_x, y1 + off_y), (x2 + off_x, y2 + off_y), colour, 2)
+
+    if region is not None:
+        left, top, width, height = region
+        cv2.rectangle(canvas, (left, top), (left + width, top + height),
+                      TUNE_REGION_COLOR, 1)
+
+    target = None
+    if primary is not None:
+        target = (off_x + primary["center"][0], off_y + primary["center"][1])
+    lines = tune_panel_lines(mode_name, target,
+                             primary["area"] if primary else 0, len(blobs), reaction_ms)
+    for row, text in enumerate(lines):
+        if not text:
+            continue
+        cv2.putText(canvas, text, (12, 26 + row * 17), cv2.FONT_HERSHEY_PLAIN,
+                    1.0, TUNE_TEXT_COLOR, 1, cv2.LINE_AA)
+    return canvas
+
+
+def remember_tune_frame(canvas):
+    """Кладёт размеченный кадр в кольцевой буфер.
+
+    Держим в памяти в JPEG, а не на диске: иначе интересный момент теряется
+    среди сотен кадров в секунду, а так ты досматриваешь до странности и
+    сбрасываешь ровно её.
+    """
+    ok, encoded = cv2.imencode(".jpg", canvas,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), TUNE_JPEG_QUALITY])
+    if not ok:
+        return
+    _tune["frames"].append(encoded.tobytes())
+    limit = max(1, int(cfg.tune_frames))
+    del _tune["frames"][:-limit]
+
+
+def capture_tune_frame(blobs, primary, region, mode_name, reaction_ms):
+    """Снимает весь экран, размечает и кладёт в буфер.
+
+    Снимаем целиком даже в режиме Ctrl, где детекция смотрит только квадрат:
+    по вырезанному квадрату без окружения непонятно, что происходило, а
+    границу области рисуем отдельной рамкой.
+    """
+    if not cfg.tune_mode:
+        return
+    try:
+        whole = {"left": 0, "top": 0, "width": screen_width, "height": screen_height}
+        frame = np.array(main_sct.grab(whole), dtype=np.uint8)
+        canvas = annotate_tune_frame(frame, (region[0], region[1]), blobs, primary,
+                                     region, mode_name, reaction_ms)
+        remember_tune_frame(canvas)
+    except Exception as exc:              # noqa: BLE001 — отладке ронять цикл незачем
+        print(paint("[Отладка]", "red"), f"кадр не снят: {exc}")
+
+
+def dump_tune_frames():
+    """Пишет накопленные кадры на диск, каждый сброс — в свою папку."""
+    frames = list(_tune["frames"])
+    if not frames:
+        print(paint("[Отладка]", "yellow"), "кадров пока нет.")
+        return
+    # отметка времени идёт до секунд, а два сброса подряд укладываются в одну
+    # секунду — тогда дописываем номер, иначе второй затёр бы первый
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    folder = os.path.join(SCRIPT_DIR, TUNE_DIR, stamp)
+    suffix = 2
+    while os.path.exists(folder):
+        folder = os.path.join(SCRIPT_DIR, TUNE_DIR, f"{stamp}-{suffix}")
+        suffix += 1
+    try:
+        os.makedirs(folder)
+        for number, data in enumerate(frames, 1):
+            with open(os.path.join(folder, f"{number:02d}.jpg"), "wb") as handle:
+                handle.write(data)
+    except OSError as exc:
+        print(paint("[Отладка]", "red"), f"не удалось записать: {exc}")
+        return
+    _tune["dumps"] += 1
+    print(paint("[Отладка]", "green"), f"{len(frames)} кадров -> {folder}")
+
+
+def clear_tune_dir():
+    """Стирает всё, что накопилось в папке отладочных кадров."""
+    root = os.path.join(SCRIPT_DIR, TUNE_DIR)
+    if not os.path.isdir(root):
+        print(paint("[Отладка]", "dim"), "папка пуста.")
+        return
+    try:
+        shutil.rmtree(root)
+        print(paint("[Отладка]", "green"), f"содержимое {root} удалено.")
+    except OSError as exc:
+        print(paint("[Отладка]", "red"), f"не удалось удалить: {exc}")
+
+
+def tune_pause_toggle():
+    """Клавиша стоп в отладочном режиме: сперва пауза, потом очистка папки.
+
+    Пауза нужна, чтобы успеть скопировать нужные кадры к себе: повторное
+    нажатие папку стирает. В обычном режиме та же клавиша по-прежнему
+    завершает работу.
+    """
+    if not _tune["paused"]:
+        _tune["paused"] = True
+        print(paint("[Отладка]", "yellow"),
+              f"пауза. Скопируй нужное из {TUNE_DIR}; "
+              f"{cfg.panic_key.upper()} ещё раз — очистить папку и продолжить.")
+        return
+    clear_tune_dir()
+    _tune["paused"] = False
+    print(paint("[Отладка]", "green"), "продолжаю.")
 
 
 # ---------- Конфиг: профили настроек ----------
@@ -1748,6 +2510,7 @@ _config = {"data": None, "active": DEFAULT_PROFILE_NAME, "autosave_ok": True}
 # главный (автосохранение при выходе). RLock, потому что операции вложены —
 # profile_delete внутри себя зовёт save_config_file.
 _config_lock = threading.RLock()
+
 
 
 def builtin_defaults():
@@ -1935,21 +2698,27 @@ def print_profiles_page():
             marks.append("активный")
         if name == data["default_profile"]:
             marks.append("грузится при запуске")
-        print(f"  {name}" + (f"   <- {', '.join(marks)}" if marks else ""))
-    print(
-        "\n  profile save [имя]     — сохранить текущие настройки в профиль\n"
-        "  profile load <имя>     — загрузить профиль\n"
-        "  profile delete <имя>   — удалить профиль (спросит подтверждение)\n"
-        "  profile default <имя>  — какой профиль грузить при запуске\n"
-        "  profile defaults       — вернуть встроенные значения из кода\n"
-        "  reset_config           — стереть файл целиком (спросит подтверждение)\n"
-    )
+        label = paint(name, "green" if marks else None)
+        print(f"  {label}" + (paint(f"   <- {', '.join(marks)}", "dim") if marks else ""))
+    print()
+    for name, what in (
+        ("profile save [имя]", "сохранить текущие настройки в профиль"),
+        ("profile load <имя>", "загрузить профиль"),
+        ("profile delete <имя>", "удалить профиль (спросит подтверждение)"),
+        ("profile default <имя>", "какой профиль грузить при запуске"),
+        ("profile defaults", "вернуть встроенные значения из кода"),
+        ("reset_config", "стереть файл целиком (спросит подтверждение)"),
+    ):
+        print(f"  {paint(name.ljust(22), 'cyan')} {what}")
+    print()
 
 
 def run_profile_command(args):
     if not args:
+        page("Профили настроек")
         print_profiles_page()
         return
+    page("Профили настроек")
     sub_cmd = args[0].lower()
     name = args[1] if len(args) > 1 else None
     if sub_cmd == "save":
@@ -2048,41 +2817,41 @@ def console_loop():
         try:
             if cmd == "help":
                 if len(parts) > 1:
-                    print_topic_help(" ".join(parts[1:]))
+                    page("Настройка", parts[1])
+                    describe_setting(parts[1])
                 else:
                     print_help()
-            elif cmd == "show":
-                print_settings()
-            elif cmd == "log":
-                cfg.debug_log = parse_bool(parts[1])
-            elif cmd == "overlay":
-                set_overlay_enabled(parse_bool(parts[1]))
-            elif cmd == "click":
-                cfg.auto_click = parse_bool(parts[1])
-            elif cmd == "save":
-                cfg.save_last_frame = parse_bool(parts[1])
             elif cmd == "bench":
+                page("Замер скорости")
                 run_benchmark()
-            elif cmd == "edit":
-                print_settings_menu()
             elif cmd == "window":
-                print_window_info()
-            elif cmd == "profiles":
-                print_profiles_page()
-            elif cmd == "profile":
-                run_profile_command(parts[1:])
+                if len(parts) > 1 and parts[1].lower() == "pick":
+                    page("Выбор окна")
+                    pick_window()
+                else:
+                    page("Привязка к окну")
+                    print_window_info()
+            elif cmd in ("profile", "profiles"):
+                if len(parts) > 1:
+                    run_profile_command(parts[1:])
+                else:
+                    page("Профили настроек")
+                    print_profiles_page()
             elif cmd == "reset_config":
                 reset_config()
             elif cmd == "set":
                 if len(parts) == 1:
-                    print("Формат: set <имя> <значение>. Введи 'edit', чтобы увидеть все переменные.")
-                elif len(parts) == 2:
-                    describe_setting(parts[1])          # без значения — показываем текущее и описание
+                    print("Формат: set <имя> <значение>. 'help' покажет все настройки.")
                 else:
-                    # значение склеиваем: в заголовке окна бывают пробелы
-                    apply_setting(parts[1], " ".join(parts[2:]))
+                    page("Настройка", parts[1])
+                    if len(parts) == 2:
+                        describe_setting(parts[1])      # без значения — текущее и описание
+                    else:
+                        # значение склеиваем: в заголовке окна бывают пробелы
+                        apply_setting(parts[1], " ".join(parts[2:]))
+                        describe_setting(parts[1])
             else:
-                print("Неизвестная команда. Введи 'help'.")
+                print(f"Неизвестная команда: {cmd}. Введи 'help'.")
         except (IndexError, ValueError):
             print("Неверный формат команды. Введи 'help'.")
 
@@ -2099,9 +2868,11 @@ def print_header():
     print("  " + paint("AimTracker", "bold"))
     print(rule)
     key = lambda k: paint(k, "cyan")           # noqa: E731 — локальный сокращатель
-    print(f"  {key('Ctrl')}  слежение у прицела        {key(AUTOCLICK_TOGGLE_KEY.upper())}  автоклик")
-    print(f"  {key('Alt')}   слежение по всему окну    {key(OVERLAY_TOGGLE_KEY.upper())}  рамка оверлея"
-          f"     {key(PANIC_KEY.upper())}  {paint('СТОП', 'red')}")
+    print(f"  {key(cfg.track_key.upper()):<22} слежение у прицела"
+          f"      {key(cfg.autoclick_key.upper())}  автоклик")
+    print(f"  {key(cfg.fullscreen_key.upper()):<22} слежение по окну"
+          f"        {key(cfg.overlay_key.upper())}  рамка"
+          f"     {key(cfg.panic_key.upper())}  {paint('СТОП', 'red')}")
     print()
 
     last = _aim["last_match"]
@@ -2125,6 +2896,7 @@ def print_header():
 _vt["ok"] = enable_vt()     # до любого цветного вывода: иначе первые строки выйдут серыми
 startup_load_config()
 set_overlay_enabled(cfg.overlay_enabled)  # запускает грабер, если оверлей выключен
+rebind_hotkeys()            # переключатели вешаются на клавиши из настроек
 update_aim_context()        # чтобы шапка показала реальную привязку, а не "окно не найдено"
 print_header()
 # Бенчмарк — до запуска консоли: иначе команда из консоли (например
@@ -2153,16 +2925,20 @@ try:
         # можно свернуть, подвинуть или переключиться из него в другое
         viewport = update_aim_context()
 
-        if keyboard.is_pressed(TRACK_KEY):
-            tracking_key = "Ctrl"
+        if _tune["paused"]:
+            tracking_key = None       # на паузе ничего не снимаем и не двигаем
+        elif is_key_held(cfg.track_key):
+            tracking_key = cfg.track_key.capitalize()
+            _detect["mode"] = "Margin"
             # снимок на итерацию: margin правится из консоли прямо во время работы
             margin = int(cfg.margin)
             cross_x, cross_y = _aim["crosshair"]
             left, top, width, height = clamp_region(
                 cross_x - margin, cross_y - margin, margin * 2, margin * 2)
             found = track(left, top, width, height, offset_x=left, offset_y=top)
-        elif keyboard.is_pressed(FULLSCREEN_KEY):
-            tracking_key = "Alt"
+        elif is_key_held(cfg.fullscreen_key):
+            tracking_key = cfg.fullscreen_key.capitalize()
+            _detect["mode"] = "Fullscreen"
             # когда игра идёт в окне, незачем разглядывать остальной рабочий стол
             if viewport is None:
                 left, top, width, height = 0, 0, screen_width, screen_height
@@ -2170,7 +2946,7 @@ try:
                 left, top, width, height = clamp_region(*viewport)
             found = track(left, top, width, height, offset_x=left, offset_y=top)
 
-        if not found and cfg.overlay_enabled:
+        if not found and cfg.overlay_enabled and not overlay_is_held():
             overlay.hide_all_and_wait()
         if not found:
             _stat["target"] = None
