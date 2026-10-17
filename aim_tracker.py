@@ -286,6 +286,7 @@ KEY_SETTINGS = ("track_key", "fullscreen_key", "autoclick_key",
 
 PRIMARY_COLOR = "#00FF00"
 SECONDARY_COLOR = "#FFA500"
+REGION_COLOR = "#00BFFF"
 CROP_PADDING = 15
 MAX_BLOBS_SHOWN = 24
 FAILSAFE_MARGIN = 2  # на столько пикселей держимся подальше от углов экрана (см. clamp_to_safe_area)
@@ -335,6 +336,8 @@ class Config:
         self.min_blob_area = 4          # мин. площадь пятна в пикселях (отсекает шум)
         self.move_duration = 0.0        # плавность движения мыши (0 = мгновенно, быстрее всего)
         self.hide_settle_delay = 0.02   # пауза после скрытия рамок (только режим с оверлеем)
+        self.box_hold = 0.0             # сколько держать рамки на экране, сек (0 = как раньше)
+        self.margin_preview = 2.0       # сколько показывать квадрат области после смены margin, сек
         self.denoise_kernel = 3         # размер ядра фильтра шума перед поиском пятен (0 = выкл)
         self.lock_radius = 120          # радиус залипания на цель в пикселях (0 = выкл)
         self.lock_timeout = 0.35        # через столько секунд без детекций цель забывается (сек)
@@ -486,6 +489,7 @@ _aim = {
     "relative": False,
     "last_delta": (0, 0),
     "last_match": None,     # (заголовок, область) последнего найденного окна игры
+    "last_seen": 0.0,       # когда его видели в последний раз
 }
 
 
@@ -506,6 +510,7 @@ def update_aim_context():
             viewport = client_rect_on_screen(hwnd)
             if viewport is not None:
                 _aim["last_match"] = (title, viewport)
+                _aim["last_seen"] = time.perf_counter()
 
     if viewport is None:
         _aim["crosshair"] = (center_x, center_y)
@@ -579,6 +584,9 @@ class Overlay:
             self.canvas.create_rectangle(-10, -10, -10, -10, outline=SECONDARY_COLOR, width=self.thickness)
             for _ in range(self.max_rects)
         ]
+        # отдельный прямоугольник под область слежения: он не блоб, и цвет у него свой
+        self.region_id = self.canvas.create_rectangle(
+            -10, -10, -10, -10, outline=REGION_COLOR, width=self.thickness)
 
         self.root.update_idletasks()
         self._make_click_through()
@@ -623,7 +631,16 @@ class Overlay:
         def _hide():
             for rect_id in self.rect_ids:
                 self.canvas.coords(rect_id, -10, -10, -10, -10)
+            self.canvas.coords(self.region_id, -10, -10, -10, -10)
         self._run_synced(_hide)
+
+    def show_region_and_wait(self, box):
+        """Рисует границу области слежения — чтобы видеть, куда достаёт детекция."""
+        def _draw():
+            self.canvas.coords(self.region_id, *box)
+        self._run_synced(_draw)
+        with self._shown_lock:
+            self._boxes_shown = True
 
     def show_boxes_and_wait(self, boxes, primary_index=0):
         def _draw():
@@ -1011,6 +1028,33 @@ def render_status(key_name):
 _settle_until = [0.0]
 
 
+# Пока не истекло, рамки остаются на экране, а съёмка не идёт: иначе рамка
+# попала бы в собственный скриншот, а разглядеть её всё равно не успеваешь —
+# при обычном цикле она жила один такт, пару миллисекунд.
+_overlay_hold = [0.0]
+
+
+def hold_overlay(seconds):
+    if seconds > 0:
+        _overlay_hold[0] = max(_overlay_hold[0], time.perf_counter() + seconds)
+
+
+def overlay_is_held():
+    return time.perf_counter() < _overlay_hold[0]
+
+
+def preview_region():
+    """Показывает квадрат области слежения на margin_preview секунд."""
+    if cfg.margin_preview <= 0 or not cfg.overlay_enabled or overlay.error is not None:
+        return
+    margin = int(cfg.margin)
+    cross_x, cross_y = _aim["crosshair"]
+    left, top, width, height = clamp_region(cross_x - margin, cross_y - margin,
+                                            margin * 2, margin * 2)
+    overlay.show_region_and_wait((left, top, left + width, top + height))
+    hold_overlay(cfg.margin_preview)
+
+
 def hold_after_action():
     """Запрещает съёмку, пока не осядет картинка после нашего действия."""
     if cfg.settle_after_action > 0:
@@ -1148,6 +1192,8 @@ def maybe_save_last_frame(arr_bgr, bbox, region_w, region_h):
 
 def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y):
     """Точный, но медленный режим: рамка синхронно прячется/показывается вокруг захвата."""
+    if overlay_is_held():
+        return False          # рамки ещё показываются, снимать нельзя — попадут в кадр
     if not frames_are_trustworthy():
         return False          # ещё не осела картинка после нашего же движения
 
@@ -1173,6 +1219,7 @@ def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y
         for (x1, y1, x2, y2) in (b["bbox"] for b in blobs[:MAX_BLOBS_SHOWN])
     ]
     overlay.show_boxes_and_wait(screen_boxes, primary_index=0)
+    hold_overlay(cfg.box_hold)
     t3 = time.perf_counter()
 
     local_cx, local_cy = primary["center"]
@@ -1358,6 +1405,8 @@ MIN_VALUES = {
     "camera_gain": 0.01,
     "click_interval": 0.0,
     "status_hz": 0,
+    "box_hold": 0.0,
+    "margin_preview": 0.0,
     "settle_after_action": 0.0,
     "global_motion_limit": 0.0,
     "click_tolerance": 0,
@@ -1438,6 +1487,8 @@ def assign_setting(name, value):
     setattr(cfg, name, value)
     if name in KEY_SETTINGS:
         rebind_hotkeys()        # переключатели должны переехать на новую клавишу
+    if name == "margin":
+        preview_region()        # наглядно, куда теперь достаёт детекция
 
 
 def apply_setting(name, raw):
@@ -1490,6 +1541,8 @@ SETTINGS_GROUPS = [
     ("Скорость", (
         ("scan_interval",     "пауза между итерациями главного цикла, сек"),
         ("hide_settle_delay", "пауза после скрытия рамок перед захватом, сек (только режим с оверлеем)"),
+        ("box_hold",          "сколько держать рамки на экране, сек: 0 = мелькают один такт"),
+        ("margin_preview",    "сколько показывать квадрат области после смены margin, сек"),
     )),
     ("Режимы и вывод", (
         ("overlay_enabled",   "рамка оверлея: on = точнее и медленнее, off = быстрый режим (F7)"),
@@ -1708,6 +1761,27 @@ on — красить через силу. Пригодится, если тер
 
 off — никогда. На скорость цвет не влияет.""",
 
+    "box_hold": """\
+Сколько секунд держать рамки найденных пятен на экране. 0 — прежнее
+поведение.
+
+При нуле рамка живёт ровно один такт цикла — на обычных настройках это пара
+миллисекунд, и разглядеть её невозможно. Дольше держать нельзя просто так:
+пока рамка на экране, снимать кадры запрещено, иначе она попадёт в
+собственный скриншот, будет засчитана за изменение и начнёт разрастаться.
+Поэтому удержание рамок ПРИОСТАНАВЛИВАЕТ детекцию на это время.
+
+Для настройки ставь 0.3-0.5 и смотри, что скрипт считает целью. Для работы
+возвращай 0.""",
+
+    "margin_preview": """\
+Сколько секунд показывать голубой квадрат области слежения после смены
+margin. 0 — не показывать.
+
+Нужно, чтобы видеть глазами, куда достаёт детекция в режиме Ctrl, а не
+прикидывать по числу. Как и box_hold, на это время приостанавливает
+детекцию: квадрат тоже нельзя снимать вместе с экраном.""",
+
     "settle_after_action": """\
 Сколько не доверять кадрам после собственного движения мыши или клика,
 в секундах. 0 — проверка выключена.
@@ -1908,30 +1982,28 @@ def print_window_info():
     команду в консоли, активна именно консоль, так что первое почти всегда
     будет "не совпадает" — смотреть надо на второе.
     """
-    try:
-        hwnd, title = foreground_window_title()
-    except Exception as exc:               # noqa: BLE001 — диагностике падать незачем
-        print(f"[Окно] Не удалось опросить активное окно: {exc}")
-        return
-
     needle = cfg.window_title.strip()
-    matched = bool(needle) and needle.lower() in title.lower()
     print(f"\n  Ключевое слово:  {needle!r}")
-    print(f"  Активно сейчас:  {title!r}  ->  {'совпадает' if matched else 'не совпадает'}")
 
     last = _aim["last_match"]
     if last is None:
-        print("  Окно игры ещё ни разу не попадалось.")
+        print("  " + paint("Окно игры ещё ни разу не попадалось.", "yellow"))
         print(f"  Прицел: центр экрана ({center_x}, {center_y}).")
     else:
+        # Активное сейчас окно не показываем: пока набираешь команду, активна
+        # консоль, и ответ был бы всегда один и тот же. Смысл несёт последнее
+        # совпадение и то, насколько оно свежее.
         last_title, (left, top, width, height) = last
-        print(f"  Последнее совпавшее: {last_title!r}")
-        print(f"    клиентская область {width}x{height} в точке ({left}, {top})")
-        print(f"    прицел ({left + width // 2}, {top + height // 2})")
+        ago = time.perf_counter() - _aim["last_seen"]
+        when = "прямо сейчас" if ago < 1.5 else f"{ago:.0f} с назад"
+        print(f"  Привязано к:     {last_title!r}")
+        print(f"  Видели:          {when}")
+        print(f"  Область игры:    {width}x{height} в точке ({left}, {top})")
+        print(f"  Прицел:          ({left + width // 2}, {top + height // 2})")
 
     way = "относительное (SendInput)" if _aim["relative"] else "абсолютное (SetCursorPos)"
-    print(f"  aim_mode={cfg.aim_mode} -> сейчас движение {way}")
-    print("  Абсолютное движение игра с raw input не увидит.\n")
+    print(f"  Движение мыши:   {way}   (aim_mode={cfg.aim_mode})")
+    print("  " + paint("Абсолютное движение игра с raw input не увидит.", "dim") + "\n")
 
 
 def print_settings():
@@ -2378,7 +2450,7 @@ try:
                 left, top, width, height = clamp_region(*viewport)
             found = track(left, top, width, height, offset_x=left, offset_y=top)
 
-        if not found and cfg.overlay_enabled:
+        if not found and cfg.overlay_enabled and not overlay_is_held():
             overlay.hide_all_and_wait()
         if not found:
             _stat["target"] = None

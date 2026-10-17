@@ -9,7 +9,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUITES = ["test_bootstrap.py", "test_startup.py", "test_console.py",
-          "test_color_and_help.py", "test_feedback_and_keys.py"]
+          "test_color_and_help.py", "test_feedback_and_keys.py",
+          "test_overlay_hold.py"]
 
 
 def main():
