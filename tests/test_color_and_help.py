@@ -120,19 +120,13 @@ check("'set <имя>' печатает длинный текст", "ВКЛ (ра
 check("и короткое описание тоже", "рамка оверлея" in out)
 check("и подсказку, как менять", "изменить: set overlay_enabled" in out)
 
-print("== help <тема> ==")
-out = grab(G['print_topic_help'], "режимы")
-check("тема 'режимы' описывает оба режима захвата",
-      "РЕЖИМЫ ЗАХВАТА" in out and "одно ядро процессора" in out)
-out = grab(G['print_topic_help'], "детекция")
-check("тема 'детекция' объясняет конвейер по шагам",
-      "diff_threshold" in out and "min_blob_area" in out and "lock_radius" in out)
-out = grab(G['print_topic_help'], "ерунда")
-check("неизвестная тема перечисляет доступные",
-      "Нет такой темы" in out and "режимы" in out and "профили" in out)
-out = grab(G['print_help'])
-check("в справке есть 'help <тема>'", "help <тема>" in out)
-check("справка перечисляет темы", all(t in out for t in G['HELP_TOPICS']))
+print("== описания есть у ВСЕХ настроек ==")
+uncovered = [n for n in vars(cfg) if n not in G['SETTINGS_HELP']]
+check("ни одна настройка не осталась без разбора", not uncovered, f"  {uncovered}")
+no_short = [n for n in vars(cfg) if n not in G['SETTINGS_INFO']]
+check("и без короткого описания тоже", not no_short, f"  {no_short}")
+out = grab(G['describe_setting'], "нетакой")
+check("неизвестное имя не падает", "Нет такой настройки" in out)
 
 print("== все тексты укладываются в 80 колонок ==")
 # мерим напечатанное, а не хранимое: перенос делается на выводе
@@ -146,9 +140,6 @@ for cols in ("78", "60", "100"):
     for name in G['SETTINGS_HELP']:
         n, line = widest_of(G['describe_setting'], name)
         if n > worst[0]: worst = (n, line, f"set {name}")
-    for key in G['HELP_TOPICS']:
-        n, line = widest_of(G['print_topic_help'], key)
-        if n > worst[0]: worst = (n, line, f"help {key}")
     # 'профили' содержит выровненную по колонкам таблицу команд: переложить её
     # под узкое окно нельзя, не потеряв выравнивание — для неё предел 80
     limit = min(int(cols), 80) if int(cols) >= 78 else 80
@@ -162,13 +153,11 @@ for cols in ("78", "60", "100"):
     check(f"при окне {cols}: проза переложена под окно",
           prose[0] <= min(int(cols), 80), f"  ({prose[0]} в '{prose[2]}')")
 os.environ["COLUMNS"] = "78"
-flat = [l for t in list(G['SETTINGS_HELP'].values())
-        + [v[1] for v in G['HELP_TOPICS'].values()] for l in t.splitlines()]
+flat = [l for t in G['SETTINGS_HELP'].values() for l in t.splitlines()]
 check("нет хвостовых пробелов в текстах", not [l for l in flat if l != l.rstrip()])
-out = grab(G['print_topic_help'], "детекция")
-check("нумерованный список не переложен", "1. Два снимка области" in out, f"\n      {out[:200]}")
-check("блок команд в 'профили' сохранил выравнивание",
-      "  profiles               список" in grab(G['print_topic_help'], "профили"))
+out = grab(G['describe_setting'], "overlay_enabled")
+check("длинный разбор переложен под окно",
+      max(len(l) for l in ESC.sub("", out).splitlines()) <= 78)
 
 print("\nПРОВАЛОВ: %d" % len(fails))
 for f in fails: print("  -", f)

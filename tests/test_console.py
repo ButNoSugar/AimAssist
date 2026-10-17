@@ -114,6 +114,47 @@ check("описание под именем, а не в строку", "\n      
 check("группы заглавными", "ДЕТЕКЦИЯ" in menu and "ПРИЦЕЛ В ИГРЕ" in menu)
 check("значения и границы на месте", "0.01..5.0" in menu and "auto|absolute|relative" in menu)
 
+
+print("== волна 3: команды сведены в одну страницу ==")
+def run_cmd(text):
+    out = io.StringIO(); keep = sys.stdout; sys.stdout = out
+    sys.stdin = keyboard.EofFlagStdin(text)
+    try: G['console_loop']()
+    finally: sys.stdout = keep
+    return out.getvalue()
+
+import re as _re2
+NOANSI = _re2.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+G['cfg'].color = "off"
+
+out = NOANSI.sub("", run_cmd("help\n"))
+check("help показывает и команды, и настройки",
+      "AIMTRACKER" in out and "НАСТРОЙКИ" in out and "camera_gain" in out)
+check("в списке команд нет edit/show", "  edit " not in out and "  show " not in out)
+check("версия в шапке", "v" in out.split("AIMTRACKER")[1][:12])
+
+for gone in ("edit", "show", "log on", "overlay on", "click on", "save on"):
+    out = NOANSI.sub("", run_cmd(gone + "\n"))
+    check(f"команда '{gone}' убрана", "Неизвестная команда" in out, f"  {out.strip()[:60]!r}")
+
+print("== волна 3: каждая команда — своя страница ==")
+for cmd, title in (("window\n", "ПРИВЯЗКА К ОКНУ"), ("profile\n", "ПРОФИЛИ НАСТРОЕК"),
+                   ("help margin\n", "НАСТРОЙКА"), ("set margin\n", "НАСТРОЙКА")):
+    out = NOANSI.sub("", run_cmd(cmd))
+    check(f"'{cmd.strip()}' открывает страницу {title}", title in out, f"  {out.strip()[:70]!r}")
+
+out = run_cmd("window\n")
+check("страница чистит экран перед выводом", "\x1b[2J" in out or "\x1b[H" in out,
+      f"  {out[:20]!r}")
+
+out = NOANSI.sub("", run_cmd("set camera_gain 0.42\n"))
+check("set подтверждает и показывает разбор",
+      "изменено:" in out and "camera_gain = 0.42" in out and "Насколько резко" in out)
+check("значение применилось", abs(G['cfg'].camera_gain - 0.42) < 1e-9)
+out = NOANSI.sub("", run_cmd("set camera_gain 99\n"))
+check("отказ виден как отказ", "не принято:" in out, f"  {out.strip()[:80]!r}")
+G['cfg'].camera_gain = 0.5
+
 print("\nПРОВАЛОВ: %d" % len(fails))
 for f in fails: print("  -", f)
 sys.exit(1 if fails else 0)
