@@ -45,6 +45,7 @@ check("по истечении удержание снято", G['overlay_is_hel
 print("== 6: удержание берётся из настройки после показа рамок ==")
 cfg.box_hold = 0.25
 cfg.settle_after_action = 0.0
+cfg.confirm_frames = 1  # isolate overlay hold from temporal confirmation
 G['_overlay_hold'][0] = 0.0
 grab(G['track_synced'], 0, 0, 200, 200, 0, 0)
 check("после детекции рамки удерживаются", G['overlay_is_held']() is True)

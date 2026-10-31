@@ -56,7 +56,9 @@ check("SendInput получил смещение от прицела", WIN["sent
 
 print("== клик-троттлинг на месте ==")
 check("click_interval в настройках", hasattr(G['cfg'], 'click_interval'))
-check("click_is_due пускает при 0", G['cfg'].click_interval == 0.0 and G['click_is_due']() is True)
+check("по умолчанию клики ограничены", G['cfg'].click_interval > 0)
+G['cfg'].click_interval = 0.0
+check("click_is_due пускает при явно заданном 0", G['click_is_due']() is True)
 
 print("== hold_console не вешает процесс без tty ==")
 done = threading.Event()

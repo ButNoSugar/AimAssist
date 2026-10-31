@@ -31,14 +31,15 @@ def quiet(fn, *a, **k):
     finally: sys.stdout = keep
     return out.getvalue()
 
-print("== отсеянные блобы отдаются только в отладочном режиме ==")
+print("== отсеянные блобы доступны для объяснения решения ==")
 base = np.zeros((200, 200, 4), np.uint8); base[:, :, 3] = 255
 shot = base.copy()
 shot[20:40, 20:40, :3] = 255        # крупное пятно
 shot[100:102, 100:102, :3] = 255    # мелкое, ниже порога площади
 cfg.tune_mode = False
 blobs, _ = G['find_blobs_arr'](base, shot, 30, 50, 0)
-check("в боевом режиме отсеянные не собираются", G['_detect']["rejected"] == [])
+check("причина отсева доступна без записи", len(G['_detect']["rejected"]) == 1 and
+      G['_detect']["rejected"][0]["reason"] == "too_small")
 cfg.tune_mode = True
 blobs, _ = G['find_blobs_arr'](base, shot, 30, 50, 0)
 check("в отладочном собираются", len(G['_detect']["rejected"]) == 1,
@@ -99,15 +100,14 @@ quiet(G['dump_tune_frames'])
 check("второй сброс в отдельную папку, не поверх",
       len(glob.glob(os.path.join(work, "tune", "*"))) == 2)
 
-print("== клавиша стоп в отладке: пауза, потом очистка ==")
+print("== аварийная остановка в отладке сохраняет записи ==")
 G['_tune']["paused"] = False
 out = quiet(G['panic_stop'])
-check("первое нажатие — пауза, не выход",
-      G['_tune']["paused"] is True and not G['_stop'].is_set(), f"  {out.strip()[:60]!r}")
-check("сказано, что копировать надо самому", "Скопируй нужное" in out)
+check("первое нажатие останавливает", G['_stop'].is_set(), f"  {out.strip()[:60]!r}")
+check("папка с кадрами сохранена", os.path.isdir(os.path.join(work, "tune")))
 out = quiet(G['panic_stop'])
-check("второе нажатие сняло паузу", G['_tune']["paused"] is False)
-check("папка отладки очищена", not os.path.isdir(os.path.join(work, "tune")),
+check("повторное нажатие не возобновляет ввод", G['_stop'].is_set())
+check("повторное нажатие не удаляет записи", os.path.isdir(os.path.join(work, "tune")),
       f"  {glob.glob(os.path.join(work, 'tune', '*'))}")
 
 print("== в боевом режиме клавиша стоп по-прежнему останавливает ==")

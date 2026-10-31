@@ -92,7 +92,7 @@ G['update_aim_context']()
 line = "".join(t for t, _ in G['render_status']("Ctrl"))
 check("есть режим, цель, пятна, залипание, задержка",
       all(s in line for s in ("[Ctrl]", "(781,469)", "24px", "2", "lock", "4.1")), f"\n      {line}")
-check("назван способ движения", "SendInput" in line or "курсор" in line)
+check("назван способ движения или наблюдение", any(word in line for word in ("SendInput", "курсор", "наблюдение")))
 G['_stat']["target"] = None
 check("без цели — 'ищу'", "ищу" in "".join(t for t, _ in G['render_status']("Alt")))
 

@@ -1,5 +1,8 @@
 """Заглушки Windows/GUI-зависимостей, чтобы прогнать aim_tracker.py на Linux."""
-import sys, types, ctypes, io, os
+import sys, types, ctypes, io, os, shutil
+
+# Load POSIX shutil before platform emulation on Python 3.12+.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 # заглушки эмулируют именно Windows — иначе скрипт справедливо откажется стартовать
 sys.platform = "win32"

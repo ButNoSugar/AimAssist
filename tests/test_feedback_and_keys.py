@@ -79,6 +79,7 @@ import pyautogui
 clicks = [0]
 pyautogui.click = lambda *a, **k: clicks.__setitem__(0, clicks[0] + 1)
 cfg.auto_click = True; cfg.click_interval = 0.0; cfg.settle_after_action = 0.0
+cfg.observe_only = False
 clicks[0] = 0
 quiet(G['move_and_maybe_click'], cross[0] + 300, cross[1])
 check("первая детекция далеко от прицела — клика нет", clicks[0] == 0, f"  ({clicks[0]})")
@@ -108,8 +109,8 @@ G['apply_setting']("track_key", "небывает")
 sys.stdout = real
 check("set отбил с подсказкой", "неизвестная клавиша" in out.getvalue(), f"  {out.getvalue()[:80]!r}")
 check("значение не изменилось", cfg.track_key == "ctrl")
-quiet(G['apply_setting'], "track_key", "F9")
-check("годная клавиша принимается в нижнем регистре", cfg.track_key == "f9")
+quiet(G['apply_setting'], "track_key", "F11")
+check("свободная клавиша принимается в нижнем регистре", cfg.track_key == "f11")
 quiet(G['apply_setting'], "track_key", "ctrl")
 
 print("== 7: переключатели переезжают на новую клавишу ==")

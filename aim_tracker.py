@@ -1,15 +1,19 @@
 import atexit
 import ctypes
 import json
+import math
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
 import threading
+import tempfile
 import time
 import traceback
+from functools import wraps
 
 # ---------- Запуск без IDE ----------
 # PyCharm запускает скрипт интерпретатором из venv, а двойной клик по файлу или
@@ -134,6 +138,9 @@ import numpy as np
 import pyautogui
 import tkinter as tk
 from PIL import Image
+from aim_detection import DetectionOptions, TargetTracker, detect_changes
+from aim_recording import SessionRecorder
+from aim_panel import PanelBridge
 
 
 # ---------- Вывод в консоль ----------
@@ -349,6 +356,17 @@ def require_windows():
 # ---------- Настройки, изменяемые на лету через консоль ----------
 class Config:
     def __init__(self):
+        self.observe_only = True        # диагностика без ввода; включать действия явно
+        self.require_game_window = True
+        self.confirm_frames = 2
+        self.max_blob_fraction = 0.15
+        self.max_aspect_ratio = 8.0
+        self.ignore_bottom_fraction = 0.0
+        self.exclusion_rects = "[]"     # нормализованные области окна, JSON
+        self.compensate_camera = False  # экспериментальная компенсация общего сдвига
+        self.max_frame_age = 0.10
+        self.pair_interval = 0.016
+        self.max_mouse_step = 120
         self.aim_mode = "auto"          # auto | absolute | relative (см. move_and_maybe_click)
         self.window_exe = ""            # имя exe окна игры, задаётся через 'window pick'
         self.window_title = "Minecraft"  # запасной способ: ключевое слово в заголовке
@@ -377,7 +395,7 @@ class Config:
         self.debug_log = False          # подробный таймлог каждой детекции (основной вид — строка состояния)
         self.save_last_frame = False    # сохранять last.jpg (лишняя запись на диск = задержка)
         self.auto_click = False
-        self.click_interval = 0.0       # минимальная пауза между автокликами, сек (0 = каждую детекцию)
+        self.click_interval = 0.15      # минимальная пауза между автокликами, сек
         self.overlay_enabled = True     # True = точный, но медленный синхронный режим
                                          # False = быстрый режим с фоновым захватом экрана
         self.autosave = True            # сохранять активный профиль при выходе
@@ -391,6 +409,20 @@ class Config:
 
 
 cfg = Config()
+_state_lock = threading.RLock()
+
+
+def state_locked(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with _state_lock:
+            return function(*args, **kwargs)
+    return locked
+
+
+_panel = None
+_preview_next = [0.0]
+_gui_requested = "--gui" in sys.argv
 
 
 # ---------- Win32: относительный ввод мыши и привязка к окну игры ----------
@@ -590,9 +622,13 @@ _aim = {
     "last_delta": (0, 0),
     "last_match": None,     # (заголовок, область) последнего найденного окна игры
     "last_seen": 0.0,       # когда его видели в последний раз
+    "viewport": None,
+    "hwnd": 0,
 }
+_selected_hwnd = [None]
 
 
+@state_locked
 def update_aim_context():
     """Определяет точку прицела и способ движения на эту итерацию.
 
@@ -607,12 +643,16 @@ def update_aim_context():
         hwnd, title = foreground_window_title()
         # exe спрашиваем только когда он задан: это обращение к чужому процессу
         exe = process_name(hwnd) if (hwnd and cfg.window_exe.strip()) else ""
-        if hwnd and window_matches(title, exe):
+        if hwnd and window_matches(title, exe) and (_selected_hwnd[0] is None or hwnd == _selected_hwnd[0]):
             viewport = client_rect_on_screen(hwnd)
             if viewport is not None:
                 _aim["last_match"] = (title, viewport)
                 _aim["last_seen"] = time.perf_counter()
 
+    identity = (hwnd if viewport is not None else 0, viewport)
+    if identity != (_aim["hwnd"], _aim["viewport"]):
+        reset_tracking()
+    _aim["hwnd"], _aim["viewport"] = identity
     if viewport is None:
         _aim["crosshair"] = (center_x, center_y)
         _aim["relative"] = cfg.aim_mode == "relative"
@@ -703,13 +743,17 @@ class Overlay:
         done = threading.Event()
 
         def _job():
-            draw_fn()
-            self.root.update_idletasks()
-            self.root.update()
-            done.set()
+            try:
+                draw_fn()
+                self.root.update_idletasks()
+            except Exception as exc:
+                self.error = exc
+            finally:
+                done.set()
 
         self.root.after(0, _job)
-        done.wait(timeout=0.2)
+        if not done.wait(timeout=0.2):
+            self.error = RuntimeError("тайм-аут скрытия/отрисовки оверлея")
 
     def hide_all_and_wait(self, force=False):
         """Прячет все рамки. force=True — безусловно.
@@ -784,16 +828,25 @@ class FrameGrabber:
         self.capture_time_ms = 0.0
         self._running = False
         self._thread = None
+        self._halt = threading.Event()
+        self.error = None
 
     def start(self):
         if self._running:
             return
+        self._halt.clear()
+        self.error = None
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
+        self._halt.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+            if self._thread.is_alive():
+                raise RuntimeError("поток захвата не завершился; перезапустите программу")
 
     def set_region(self, region):
         """Переключает снимаемую область. Кадры от прежней сразу выбрасываются."""
@@ -805,8 +858,16 @@ class FrameGrabber:
             self.latest_ts = 0.0
 
     def _run(self):
+        try:
+            self._capture_loop()
+        except Exception as exc:
+            self.error = str(exc)
+        finally:
+            self._running = False
+
+    def _capture_loop(self):
         with mss.MSS() as sct:
-            while self._running:
+            while not self._halt.is_set():
                 with self.lock:
                     region = self.region
                 left, top, width, height = region
@@ -818,8 +879,9 @@ class FrameGrabber:
                     if self.region != region:
                         continue          # область сменили, пока снимали — кадр уже не нужен
                     self.latest = arr
-                    self.latest_ts = t1
+                    self.latest_ts = t0   # возраст считается от начала захвата
                     self.capture_time_ms = (t1 - t0) * 1000
+                self._halt.wait(max(0, cfg.pair_interval - (t1 - t0)))
 
     def get_latest(self, region):
         """Последний кадр, но только если он снят именно с этой области.
@@ -852,14 +914,46 @@ _prev_holder = {"frame": None}
 _last_used_ts = 0.0
 
 _lock = {"pos": None, "ts": 0.0, "held": False}
+_target_tracker = TargetTracker()
+_recorder = SessionRecorder(max_frames=cfg.tune_frames)
+_baseline_region = [None]
+_baseline_after = [0.0]
+_previous_ts = [0.0]
+_runtime = {"paused": False, "reason": "ожидание клавиши", "dirty": False,
+            "preview": None, "windows": [], "error": "", "frame_age_ms": 0.0}
+_engine_commands = queue.Queue(maxsize=128)
 
 
 def reset_lock():
     _lock["pos"] = None
     _lock["ts"] = 0.0
     _lock["held"] = False
+    _target_tracker.reset()
 
 
+def reset_frame_history():
+    global _last_used_ts
+    _prev_holder["frame"] = None
+    _last_used_ts = 0.0
+    _previous_ts[0] = 0.0
+    _baseline_after[0] = time.perf_counter()
+
+
+def reset_tracking():
+    reset_frame_history()
+    reset_lock()
+    if "_move_remainder" in globals():
+        _move_remainder.update(x=0.0, y=0.0)
+
+
+def enqueue_command(command):
+    try:
+        _engine_commands.put_nowait(command)
+    except queue.Full:
+        _runtime["error"] = "Слишком много команд; повторите изменение."
+
+
+@state_locked
 def set_overlay_enabled(enabled):
     global _last_used_ts
     if enabled and overlay.error is not None:
@@ -873,9 +967,9 @@ def set_overlay_enabled(enabled):
         _prev_holder["frame"] = None
         _last_used_ts = 0.0
         grabber.start()
-    reset_lock()
+    reset_tracking()
     print(paint("[Оверлей]", "cyan"),
-          "ВКЛ — рамка рисуется, захват синхронный (точнее, медленнее)" if enabled
+          "ВКЛ — рамка рисуется, захват синхронный (с ожиданием рамок)" if enabled
           else "ВЫКЛ — быстрый режим, кадры берутся из фонового потока")
 
 
@@ -918,10 +1012,10 @@ def rebind_hotkeys():
         except (KeyError, ValueError):
             pass
     _hotkeys = []
-    for name, action in ((cfg.autoclick_key, toggle_autoclick),
-                         (cfg.overlay_key, lambda: set_overlay_enabled(not cfg.overlay_enabled)),
+    for name, action in ((cfg.autoclick_key, lambda: enqueue_command({"command": "toggle_click"})),
+                         (cfg.overlay_key, lambda: enqueue_command({"command": "toggle_overlay"})),
                          (cfg.panic_key, panic_stop),
-                         (cfg.dump_key, dump_tune_frames)):
+                         (cfg.dump_key, lambda: enqueue_command({"command": "record"}))):
         low = name.strip().lower()
         if low in MOUSE_KEYS:
             print(paint("[Клавиши]", "yellow"),
@@ -939,17 +1033,7 @@ def toggle_autoclick():
 
 
 def panic_stop():
-    """Аварийная остановка.
-
-    В относительном режиме курсор по экрану не ездит, поэтому угловой failsafe
-    у pyautogui там не сработает — эта клавиша его заменяет.
-
-    В отладочном режиме у неё другая роль: пауза, а повторным нажатием —
-    очистка папки с кадрами.
-    """
-    if cfg.tune_mode:
-        tune_pause_toggle()
-        return
+    """F8 always stops. Recording/pause never alter the emergency action."""
     _stop.set()
     print(paint(f"\n[Стоп] Аварийная остановка по {cfg.panic_key.upper()}.", "red"))
 
@@ -1001,60 +1085,39 @@ def is_global_motion(changed_fraction):
     return True
 
 
+def detection_options(region=None):
+    rects = json.loads(cfg.exclusion_rects)
+    # User masks are relative to the game client, not the moving Ctrl crop.
+    if region is not None and _aim["viewport"] is not None:
+        vx, vy, vw, vh = _aim["viewport"]
+        rx, ry, rw, rh = region
+        mapped = []
+        if cfg.ignore_bottom_fraction > 0:
+            rects = list(rects) + [[0, 1 - cfg.ignore_bottom_fraction, 1, 1]]
+        for x1, y1, x2, y2 in rects:
+            bounds = (max(0, (vx + x1 * vw - rx) / rw),
+                      max(0, (vy + y1 * vh - ry) / rh),
+                      min(1, (vx + x2 * vw - rx) / rw),
+                      min(1, (vy + y2 * vh - ry) / rh))
+            if bounds[0] < bounds[2] and bounds[1] < bounds[3]:
+                mapped.append(bounds)
+        rects = mapped
+    return DetectionOptions(threshold=cfg.diff_threshold, min_area=cfg.min_blob_area,
+                            denoise_kernel=cfg.denoise_kernel,
+                            max_area_fraction=cfg.max_blob_fraction,
+                            max_aspect_ratio=cfg.max_aspect_ratio,
+                            ignore_bottom_fraction=(0.0 if region is not None and
+                                _aim["viewport"] is not None else cfg.ignore_bottom_fraction),
+                            ignore_rects=rects, compensate_camera=cfg.compensate_camera)
+
+
 def find_blobs_arr(arr1_bgra, arr2_bgra, threshold, min_area, denoise_kernel=0):
-    """Ищет пятна изменений между двумя кадрами.
-
-    Принимает сырые BGRA-кадры от mss как есть, без среза [:, :, :3]:
-    трёхканальный срез BGRA-массива не упакован (между пикселями 4 байта при
-    трёх каналах), и OpenCV вынужден копировать его целиком. Альфа у mss
-    константная, поэтому absdiff по ней всегда 0 и на максимум не влияет.
-
-    Возвращает (пятна, доля изменившихся пикселей). Отсеянные по min_area
-    пятна в отладочном режиме складываются в _detect["rejected"]. Доля нужна, чтобы отличить
-    цель от разворота камеры: при повороте меняется почти весь кадр.
-
-    Разница считается через absdiff/max/threshold, то есть в uint8 и на SIMD.
-    Прежний np.abs(a.astype(int16) - b.astype(int16)).max(axis=2) аллоцировал
-    два int16-буфера размером с кадр и был на порядок дороже — на полном
-    экране именно он, а не разметка, съедал основную часть времени детекции.
-    Маска на выходе побитово та же, что и раньше.
-
-    denoise_kernel > 0 применяет морфологическое "открытие" к маске перед
-    разметкой связных областей — убирает единичные шумные пиксели ДО того,
-    как cv2 начнёт размечать их по одному. Без этого сцена с постоянным
-    мелким шумом (анимация воды, рука с предметом и т.п.) может давать
-    сотни-тысячи крошечных пятен, и сама разметка становится дорогой —
-    именно это было причиной скачков diff до 75-100мс.
-    """
-    diff = cv2.absdiff(arr1_bgra, arr2_bgra)
-    b, g, r = cv2.split(diff)[:3]
-    merged = cv2.max(cv2.max(b, g), r)
-    _, mask = cv2.threshold(merged, threshold, 1, cv2.THRESH_BINARY)
-    if denoise_kernel > 0:
-        kernel = np.ones((denoise_kernel, denoise_kernel), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    changed = cv2.countNonZero(mask) / float(mask.size)
-    num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    blobs, rejected = [], []
-    for label_id in range(1, num_labels):
-        x, y, w, h, area = stats[label_id]
-        if area < min_area:
-            # в отладочном режиме их рисуют серым: видно, что именно режет порог
-            if cfg.tune_mode:
-                rejected.append({
-                    "bbox": (int(x), int(y), int(x + w), int(y + h)),
-                    "area": int(area),
-                    "center": (int(x + w // 2), int(y + h // 2)),
-                })
-            continue
-        blobs.append({
-            "bbox": (int(x), int(y), int(x + w), int(y + h)),
-            "area": int(area),
-            "center": (int(x + w // 2), int(y + h // 2)),
-        })
-    _detect["rejected"] = rejected
-    return blobs, changed
-
+    """Compatibility API, backed by the independently testable detector."""
+    options = detection_options()
+    options.threshold, options.min_area, options.denoise_kernel = threshold, min_area, denoise_kernel
+    result = detect_changes(arr1_bgra, arr2_bgra, options)
+    _detect["rejected"] = result.rejected
+    return result.blobs, result.changed_fraction
 
 def clamp_to_safe_area(x, y):
     """Отодвигает точку от углов экрана.
@@ -1070,43 +1133,21 @@ def clamp_to_safe_area(x, y):
 
 
 def select_target(blobs, offset_x, offset_y):
-    """Выбирает пятно, за которым следим, и переставляет его в начало списка.
-
-    Без залипания целью каждый кадр становится просто самое крупное пятно, и
-    курсор прыгает между разными пятнами, как только их площади меняются
-    местами — на записи это выглядит как дёрганье. Если предыдущая цель ещё
-    "жива" (с последней детекции прошло меньше lock_timeout) и в радиусе
-    lock_radius от неё есть пятно, держимся за ближайшее к ней, а не за
-    самое большое.
-
-    Пятно-цель ставится в blobs[0], поэтому вся логика ниже по коду
-    (зелёная рамка, срез MAX_BLOBS_SHOWN) продолжает работать как раньше.
-    """
-    blobs.sort(key=lambda b: b["area"], reverse=True)
-    chosen = 0
-    prev = _lock["pos"]
-    now = time.perf_counter()
-
-    if prev is not None and cfg.lock_radius > 0 and now - _lock["ts"] <= cfg.lock_timeout:
-        px, py = prev
-        best_d2 = cfg.lock_radius * cfg.lock_radius
-        for i, b in enumerate(blobs):
-            dx = offset_x + b["center"][0] - px
-            dy = offset_y + b["center"][1] - py
-            d2 = dx * dx + dy * dy
-            if d2 <= best_d2:
-                best_d2 = d2
-                chosen = i
-
-    if chosen:
-        blobs.insert(0, blobs.pop(chosen))
-
-    primary = blobs[0]
-    _lock["pos"] = (offset_x + primary["center"][0], offset_y + primary["center"][1])
-    _lock["ts"] = now
-    _lock["held"] = bool(chosen)
+    primary = _target_tracker.choose(blobs, (offset_x, offset_y), _aim["crosshair"],
+                                     time.perf_counter(), radius=cfg.lock_radius,
+                                     timeout=cfg.lock_timeout, confirm_frames=cfg.confirm_frames)
+    _lock["held"] = _target_tracker.locked
+    _lock["ts"] = time.perf_counter()
+    _lock["pos"] = ((offset_x + primary["center"][0], offset_y + primary["center"][1])
+                    if primary else None)
+    if primary is not None:
+        # Keep identity for annotation and avoid dict equality on array members.
+        for i, blob in enumerate(blobs):
+            if blob["bbox"] == primary["bbox"]:
+                primary = blobs.pop(i)
+                blobs.insert(0, primary)
+                break
     return primary
-
 
 # Побочные данные детекции: нужны только отладочному режиму, в боевом пустые.
 _detect = {"rejected": [], "mode": "Margin"}   # mode заполняет главный цикл
@@ -1121,13 +1162,14 @@ def render_status(key_name):
     Задержка красится по бюджету кадра, залипание на цель — отдельно: это два
     числа, на которые смотрят в первую очередь, когда подбирают настройки.
     """
-    way = "SendInput" if _aim["relative"] else "курсор"
+    way = "наблюдение" if cfg.observe_only else ("SendInput" if _aim["relative"] else "курсор")
     if _stat["motion"]:
         return [(f"[{key_name}]", "cyan"),
                 (f" разворот камеры — кадр пропущен ({_stat['motion'] * 100:.0f}% изменилось)",
                  "yellow")]
     if _stat["target"] is None:
         return [(f"[{key_name}]", "cyan"), (" ищу цель…   ", None),
+                (_runtime["reason"] + "   ", "dim"),
                 (f"прицел {_aim['crosshair']}   ", "dim"), (way, "dim")]
     x, y = _stat["target"]
     parts = [
@@ -1179,6 +1221,8 @@ def hold_after_action():
     """Запрещает съёмку, пока не осядет картинка после нашего действия."""
     if cfg.settle_after_action > 0:
         _settle_until[0] = time.perf_counter() + cfg.settle_after_action
+    reset_frame_history()
+    _baseline_after[0] = max(_baseline_after[0], _settle_until[0])
 
 
 def frames_are_trustworthy():
@@ -1237,6 +1281,11 @@ def move_relative_to_target(x, y):
     step_x = error_x * cfg.camera_gain + _move_remainder["x"]
     step_y = error_y * cfg.camera_gain + _move_remainder["y"]
     dx, dy = int(step_x), int(step_y)
+    length = math.hypot(dx, dy)
+    if length > cfg.max_mouse_step:
+        scale = cfg.max_mouse_step / length
+        dx, dy = int(dx * scale), int(dy * scale)
+        step_x, step_y = float(dx), float(dy)
     _move_remainder["x"] = step_x - dx
     _move_remainder["y"] = step_y - dy
     _aim["last_delta"] = (dx, dy)
@@ -1278,6 +1327,8 @@ def click_is_due():
 
 def move_and_maybe_click(x, y):
     """Наводит на цель (x, y) в экранных координатах и, если включено, кликает."""
+    if cfg.observe_only or not input_allowed():
+        return False
     # считаем ДО движения: вопрос в том, была ли цель в прицеле, когда мы её увидели
     aimed = cfg.auto_click and target_is_centred(x, y)
 
@@ -1287,9 +1338,24 @@ def move_and_maybe_click(x, y):
         move_absolute_to_target(x, y)
     hold_after_action()
 
-    if aimed and click_is_due():
+    if aimed and not _stop.is_set() and input_allowed() and click_is_due():
         pyautogui.click()
         hold_after_action()      # замах и частицы — тоже наше изменение экрана
+    return True
+
+
+def input_allowed():
+    if _stop.is_set() or _runtime["paused"] or _tune["paused"]:
+        return False
+    held_key = _runtime.get("held_key")
+    if held_key is not None and not is_key_held(held_key):
+        return False
+    if cfg.require_game_window:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        return bool(hwnd and hwnd == _aim["hwnd"] and
+                    (_selected_hwnd[0] is None or hwnd == _selected_hwnd[0]) and
+                    window_matches(window_text(hwnd), process_name(hwnd) if cfg.window_exe else ""))
+    return True
 
 
 def aim_log_suffix():
@@ -1310,112 +1376,162 @@ def maybe_save_last_frame(arr_bgr, bbox, region_w, region_h):
     Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGRA2RGB)).save("last.jpg")  # BGRA -> RGB для PIL
 
 
-def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y):
-    """Точный, но медленный режим: рамка синхронно прячется/показывается вокруг захвата."""
-    if overlay_is_held():
-        return False          # рамки ещё показываются, снимать нельзя — попадут в кадр
-    if not frames_are_trustworthy():
-        return False          # ещё не осела картинка после нашего же движения
+def process_pair(prev, current, region, prev_ts, current_ts):
+    """One shared pipeline; decisions/recordings refer to these exact inputs."""
+    started = time.perf_counter()
+    _stat["motion"] = 0.0
+    options = detection_options(region)
+    result = detect_changes(prev, current, options)
+    blobs = result.blobs
+    _detect["rejected"] = result.rejected
+    _runtime["frame_age_ms"] = max(0.0, (started - current_ts) * 1000)
+    primary = None
+    if result.reason == "camera_unreliable":
+        reason = "ненадёжная оценка движения камеры"
+        reset_lock()
+    elif is_global_motion(result.changed_fraction):
+        reason = "движение камеры — кадр пропущен"
+        reset_lock()
+    else:
+        primary = select_target(blobs, region[0], region[1])
+        reason = {"searching": "нет подходящей цели", "confirming": "кандидат ещё не подтверждён",
+                  "locked": "цель подтверждена"}.get(_target_tracker.state, result.reason)
+        if not blobs and result.rejected:
+            reason = "изменения отфильтрованы: " + str(result.rejected[0].get("reason", "фильтр"))
+    target = ((region[0] + primary["center"][0], region[1] + primary["center"][1])
+              if primary else None)
+    _runtime["reason"] = reason
+    elapsed = (time.perf_counter() - prev_ts) * 1000
+    _stat.update(target=target, blobs=len(blobs), locked=_lock["held"],
+                 area=primary["area"] if primary else 0, ms=elapsed)
+    # Rendering and optional disk output happen before the final input gate.
+    # A diagnostic failure pauses the engine rather than terminating capture.
+    try:
+        capture_tune_frame(blobs, primary, region, _detect["mode"], elapsed, frame=current,
+                           mask=result.mask)
+        if primary is not None:
+            if cfg.overlay_enabled:
+                boxes = [(region[0] + x1, region[1] + y1, region[0] + x2, region[1] + y2)
+                         for x1, y1, x2, y2 in [b["bbox"] for b in blobs[:MAX_BLOBS_SHOWN]]]
+                overlay.show_boxes_and_wait(boxes, primary_index=0)
+                if getattr(overlay, "error", None) is not None:
+                    raise RuntimeError(str(overlay.error))
+                hold_overlay(cfg.box_hold)
+            maybe_save_last_frame(current, primary["bbox"], region[2], region[3])
+    except Exception as exc:  # diagnostics must not crash the input engine
+        _runtime["paused"] = True
+        _runtime["error"] = f"Диагностика: {exc}"
 
-    overlay.hide_all_and_wait(force=True)
-    time.sleep(cfg.hide_settle_delay)
+    def action_decision():
+        if _runtime.get("paused"):
+            return False, "paused", "пауза — ввод пропущен"
+        if primary is None:
+            return False, "no_target", reason
+        if cfg.observe_only:
+            return False, "observe_only", "наблюдение: " + reason
+        if not input_allowed():
+            return False, "input_not_allowed", "окно неактивно или остановка — ввод пропущен"
+        if time.perf_counter() - current_ts > cfg.max_frame_age:
+            return False, "frame_stale", "кадр устарел — ввод пропущен"
+        return True, "", reason
 
-    region = {"left": region_left, "top": region_top, "width": region_w, "height": region_h}
-    t0 = time.perf_counter()
-    arr1 = np.array(main_sct.grab(region), dtype=np.uint8)   # BGRA как есть, см. find_blobs_arr
-    arr2 = np.array(main_sct.grab(region), dtype=np.uint8)
-    t1 = time.perf_counter()
-
-    blobs, changed = find_blobs_arr(arr1, arr2, cfg.diff_threshold,
-                                    cfg.min_blob_area, cfg.denoise_kernel)
-    t2 = time.perf_counter()
-
-    if is_global_motion(changed) or not blobs:
-        return False
-
-    primary = select_target(blobs, offset_x, offset_y)
-    screen_boxes = [
-        (offset_x + x1, offset_y + y1, offset_x + x2, offset_y + y2)
-        for (x1, y1, x2, y2) in (b["bbox"] for b in blobs[:MAX_BLOBS_SHOWN])
-    ]
-    overlay.show_boxes_and_wait(screen_boxes, primary_index=0)
-    hold_overlay(cfg.box_hold)
-    t3 = time.perf_counter()
-
-    local_cx, local_cy = primary["center"]
-    screen_cx, screen_cy = offset_x + local_cx, offset_y + local_cy
-    maybe_save_last_frame(arr2, primary["bbox"], region_w, region_h)
-    move_and_maybe_click(screen_cx, screen_cy)
-    t4 = time.perf_counter()
-    # время меряем ДО разметки и записи: иначе цифра врала бы именно о том,
-    # что этим режимом и настраивают
-    capture_tune_frame(blobs, primary, (region_left, region_top, region_w, region_h),
-                       _detect["mode"], (t4 - t0) * 1000)
-
-    _stat.update(target=(screen_cx, screen_cy), blobs=len(blobs), locked=_lock["held"],
-                 area=primary["area"], ms=(t4 - t0) * 1000, motion=0.0)
-
+    allowed, skip_reason, decision_reason = action_decision()
+    recorded, record_token = False, None
+    # Raw arrays are copied for every detection, including negative decisions,
+    # independently of the preview throttle. The decision is finalized below
+    # because even copying a large pair can make it too old for input.
+    if cfg.tune_mode:
+        try:
+            _recorder.max_frames = cfg.tune_frames
+            record_token = _recorder.remember(
+                prev, current, region,
+                {"options": vars(options), "prev_ts": prev_ts, "current_ts": current_ts,
+                 "reason": decision_reason, "detection_reason": reason, "target": target,
+                 "observe_only": cfg.observe_only, "tracker": _target_tracker.state,
+                 "action_allowed": allowed, "skip_reason": skip_reason,
+                 "input_requested": False, "decision_pending": True}, mask=result.mask)
+            recorded = True
+        except Exception as exc:
+            _runtime["paused"] = True
+            _runtime["error"] = f"Запись кадров: {exc}"
+    allowed, skip_reason, decision_reason = action_decision()
+    input_requested = False
+    if allowed:
+        input_requested = True
+        # This function rechecks focus/stop again immediately before movement.
+        if not move_and_maybe_click(*target):
+            allowed, skip_reason = False, "input_not_allowed"
+            decision_reason = "ввод отменён — окно неактивно или остановка"
+    _runtime["reason"] = decision_reason
+    _runtime["frame_age_ms"] = max(0.0, (time.perf_counter() - current_ts) * 1000)
+    if recorded:
+        try:
+            finalize = getattr(_recorder, "update_last_metadata", None)
+            if finalize is not None:
+                finalize({"reason": decision_reason, "action_allowed": allowed,
+                          "skip_reason": skip_reason, "input_requested": input_requested,
+                          "decision_pending": False,
+                          "frame_age_ms": _runtime["frame_age_ms"]}, token=record_token)
+        except Exception as exc:
+            _runtime["paused"] = True
+            _runtime["error"] = f"Запись решения: {exc}"
+    _stat["ms"] = (time.perf_counter() - prev_ts) * 1000
     if cfg.debug_log:
-        print(
-            f"[sync] пятен={len(blobs)}{' [lock]' if _lock['held'] else ''} "
-            f"area={primary['area']}px -> ({screen_cx},{screen_cy}) | "
-            f"захват={((t1 - t0) * 1000):.1f}мс diff={((t2 - t1) * 1000):.1f}мс "
-            f"оверлей={((t3 - t2) * 1000):.1f}мс move={((t4 - t3) * 1000):.1f}мс "
-            f"| итого={((t4 - t0) * 1000):.1f}мс" + aim_log_suffix()
-        )
-    return True
+        print(f"[detect] {decision_reason}; {len(blobs)} пятен; {_stat['ms']:.1f} мс; "
+              f"возраст кадра {_runtime['frame_age_ms']:.1f} мс")
+    return primary is not None
+
+
+def track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y):
+    if overlay_is_held() or not frames_are_trustworthy():
+        return False
+    overlay.hide_all_and_wait(force=True)
+    if overlay.error is not None:
+        _runtime["paused"] = True
+        _runtime["error"] = str(overlay.error)
+        return False
+    time.sleep(cfg.hide_settle_delay)
+    region = (region_left, region_top, region_w, region_h)
+    spec = dict(zip(("left", "top", "width", "height"), region))
+    prev_ts = time.perf_counter()
+    prev = np.array(main_sct.grab(spec), dtype=np.uint8)
+    # Two captures in the same rendered frame are not useful evidence.
+    if _stop.wait(cfg.pair_interval):
+        return False
+    if not input_allowed():
+        reset_tracking()
+        return False
+    current_ts = time.perf_counter()
+    current = np.array(main_sct.grab(spec), dtype=np.uint8)
+    return process_pair(prev, current, region, prev_ts, current_ts)
 
 
 def track_fast(region_left, region_top, region_w, region_h, offset_x, offset_y):
-    """Быстрый режим: без оверлея, кадры уже лежат готовые от фонового FrameGrabber."""
     global _last_used_ts
-
-    if not frames_are_trustworthy():
-        return False          # ещё не осела картинка после нашего же движения
-
     region = (region_left, region_top, region_w, region_h)
-    grabber.set_region(region)                 # в режиме Ctrl снимаем только квадрат у центра
+    if _baseline_region[0] != region:
+        reset_tracking()
+        _baseline_region[0] = region
+    if not frames_are_trustworthy():
+        _prev_holder["frame"] = None
+        return False
+    grabber.set_region(region)
     current, ts_now = grabber.get_latest(region)
-    if current is None or ts_now == _last_used_ts:
-        return False  # фоновый поток ещё не успел снять новый кадр этой области
-
-    prev = _prev_holder["frame"]
-    _prev_holder["frame"] = current
+    now = time.perf_counter()
+    if (current is None or ts_now <= _last_used_ts or ts_now < _baseline_after[0]):
+        return False
+    if now - ts_now > cfg.max_frame_age:
+        reset_frame_history()
+        _runtime["reason"] = "ожидание свежего кадра"
+        return False
+    prev, prev_ts = _prev_holder["frame"], _previous_ts[0]
+    _prev_holder["frame"], _previous_ts[0] = current, ts_now
     _last_used_ts = ts_now
-    if prev is None or prev.shape != current.shape:
+    if prev is None or prev.shape != current.shape or ts_now - prev_ts > cfg.max_frame_age:
         return False
+    return process_pair(prev, current, region, prev_ts, ts_now)
 
-    # грабер отдал ровно нужную область — вырезать из кадра больше нечего
-    t0 = time.perf_counter()
-    blobs, changed = find_blobs_arr(prev, current, cfg.diff_threshold,
-                                    cfg.min_blob_area, cfg.denoise_kernel)
-    t1 = time.perf_counter()
-
-    if is_global_motion(changed) or not blobs:
-        return False
-
-    primary = select_target(blobs, offset_x, offset_y)
-    local_cx, local_cy = primary["center"]
-    screen_cx, screen_cy = offset_x + local_cx, offset_y + local_cy
-    maybe_save_last_frame(current, primary["bbox"], region_w, region_h)
-    move_and_maybe_click(screen_cx, screen_cy)
-    t2 = time.perf_counter()
-    capture_tune_frame(blobs, primary, (region_left, region_top, region_w, region_h),
-                       _detect["mode"], (t2 - t0) * 1000)
-
-    _stat.update(target=(screen_cx, screen_cy), blobs=len(blobs), locked=_lock["held"],
-                 area=primary["area"], ms=(t2 - t0) * 1000, motion=0.0)
-
-    if cfg.debug_log:
-        print(
-            f"[fast] пятен={len(blobs)}{' [lock]' if _lock['held'] else ''} "
-            f"area={primary['area']}px -> ({screen_cx},{screen_cy}) | "
-            f"diff={((t1 - t0) * 1000):.1f}мс move={((t2 - t1) * 1000):.1f}мс "
-            f"| захват фоном ~{grabber.capture_time_ms:.1f}мс/кадр" + aim_log_suffix()
-        )
-    return True
-
-
+@state_locked
 def track(region_left, region_top, region_w, region_h, offset_x, offset_y):
     if cfg.overlay_enabled:
         return track_synced(region_left, region_top, region_w, region_h, offset_x, offset_y)
@@ -1525,6 +1641,13 @@ BOOL_FALSE = {"0", "off", "false", "no", "нет"}
 
 # нижние границы для настроек, которые иначе уронят cv2 (отрицательное ядро и т.п.)
 MIN_VALUES = {
+    "confirm_frames": 1,
+    "max_blob_fraction": 0.001,
+    "max_aspect_ratio": 1.0,
+    "ignore_bottom_fraction": 0.0,
+    "max_frame_age": 0.01,
+    "pair_interval": 0.001,
+    "max_mouse_step": 1,
     "scan_interval": 0.0,
     "diff_threshold": 0,
     "min_blob_area": 1,
@@ -1555,6 +1678,19 @@ ALLOWED_VALUES = {
 
 # верхние границы (нужны только там, где значение — доля)
 MAX_VALUES = {
+    "diff_threshold": 255,
+    "denoise_kernel": 31,
+    "confirm_frames": 30,
+    "max_blob_fraction": 1.0,
+    "max_aspect_ratio": 100.0,
+    "ignore_bottom_fraction": 0.9,
+    "max_frame_age": 1.0,
+    "pair_interval": 0.5,
+    "max_mouse_step": 1000,
+    "tune_frames": 60,
+    "scan_interval": 1.0,
+    "click_interval": 60.0,
+    "settle_after_action": 5.0,
     "move_smoothing": 1.0,
     "margin": min(center_x, center_y),   # больше — область слежения вылезет за край экрана
     "camera_gain": 5.0,
@@ -1572,7 +1708,7 @@ def parse_bool(raw):
     raise ValueError(f"ожидалось on/off, а не {raw!r}")
 
 
-def coerce_setting(name, raw):
+def coerce_setting(name, raw, key_bindings=None):
     """Приводит значение к типу текущей настройки. Бросает ValueError.
 
     Раньше в 'set' стоял безусловный float(): 'set denoise_kernel 3' записывал
@@ -1582,27 +1718,55 @@ def coerce_setting(name, raw):
     """
     current = getattr(cfg, name)
     if isinstance(current, bool):          # bool наследуется от int — проверяем его первым
-        return parse_bool(raw) if isinstance(raw, str) else bool(raw)
+        if isinstance(raw, str):
+            return parse_bool(raw)
+        if type(raw) is not bool:
+            raise ValueError("ожидалось логическое значение")
+        return raw
     if isinstance(current, str):
         value = str(raw).strip()
         if name in KEY_SETTINGS:
             if not key_is_valid(value):
                 raise ValueError(f"{value!r} — неизвестная клавиша "
                                  f"(примеры: ctrl, alt, f9, x, mouse4)")
-            return value.lower()
+            value = value.lower()
+            if name not in ("track_key", "fullscreen_key") and value in MOUSE_KEYS:
+                raise ValueError("кнопка мыши переключателем быть не может")
+            for other in KEY_SETTINGS:
+                bindings = vars(cfg) if key_bindings is None else key_bindings
+                if other != name and str(bindings.get(other, "")).lower() == value:
+                    raise ValueError(f"клавиша уже используется: {other}")
+            return value
+        if name == "exclusion_rects":
+            rects = json.loads(value)
+            if not isinstance(rects, list) or len(rects) > 32:
+                raise ValueError("ожидался список из не более 32 прямоугольников")
+            for rect in rects:
+                if (not isinstance(rect, list) or len(rect) != 4 or
+                    any(type(v) not in (int, float) or not math.isfinite(v) for v in rect) or
+                    not (0 <= rect[0] < rect[2] <= 1 and 0 <= rect[1] < rect[3] <= 1)):
+                    raise ValueError("области: [[лево,верх,право,низ], ...], координаты 0..1")
+            return json.dumps(rects)
         allowed = ALLOWED_VALUES.get(name)
         if allowed is None:
             return value                   # свободный текст, например заголовок окна
         if value.lower() not in allowed:
             raise ValueError(f"допустимо: {', '.join(allowed)}")
         return value.lower()
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError("число должно быть конечным")
     if isinstance(current, int):
-        return int(float(raw))
-    return float(raw)
+        if not value.is_integer():
+            raise ValueError("ожидалось целое число")
+        return int(value)
+    return value
 
 
 def bounds_error(name, value):
     """Текст ошибки, если значение вне допустимого диапазона, иначе None."""
+    if isinstance(value, (int, float)) and not math.isfinite(value):
+        return f"{name}: число должно быть конечным"
     if name in MIN_VALUES and value < MIN_VALUES[name]:
         return f"{name} не может быть меньше {MIN_VALUES[name]}"
     if name in MAX_VALUES and value > MAX_VALUES[name]:
@@ -1610,29 +1774,66 @@ def bounds_error(name, value):
     return None
 
 
+@state_locked
 def assign_setting(name, value):
     """Кладёт проверенное значение в cfg.
 
     overlay_enabled идёт только через сеттер: он останавливает и запускает
     фоновый грабер, и запись напрямую развела бы режимы между собой.
     """
+    _runtime["dirty"] = True
     if name == "overlay_enabled":
         set_overlay_enabled(value)
         return
     setattr(cfg, name, value)
+    if name in ("window_exe", "window_title"):
+        _selected_hwnd[0] = None
+    reset_tracking()
     if name in KEY_SETTINGS:
         rebind_hotkeys()        # переключатели должны переехать на новую клавишу
     if name == "margin":
         preview_region()        # наглядно, куда теперь достаёт детекция
 
 
+@state_locked
+def apply_settings_batch(values):
+    """Validate a panel submission completely before applying any field."""
+    if not isinstance(values, dict) or not values or len(values) > len(vars(cfg)):
+        raise ValueError("ожидался непустой набор настроек")
+    parsed = {}
+    for name, raw in values.items():
+        if name not in vars(cfg):
+            raise ValueError(f"неизвестная настройка: {name}")
+        value = coerce_setting(name, raw, key_bindings={} if name in KEY_SETTINGS else None)
+        error = bounds_error(name, value)
+        if error:
+            raise ValueError(error)
+        parsed[name] = value
+    bindings = {name: parsed.get(name, getattr(cfg, name)) for name in KEY_SETTINGS}
+    if len(set(bindings.values())) != len(bindings):
+        raise ValueError("клавиши не должны повторяться")
+    changed_keys = any(name in parsed for name in KEY_SETTINGS)
+    if changed_keys:
+        for name, value in bindings.items():
+            setattr(cfg, name, value)
+        rebind_hotkeys()
+    # Enabling mouse input is the final step after other settings apply.
+    for name, value in parsed.items():
+        if name not in KEY_SETTINGS and name != "observe_only":
+            assign_setting(name, value)
+    if "observe_only" in parsed:
+        assign_setting("observe_only", parsed["observe_only"])
+    _runtime["dirty"] = True
+    reset_tracking()
+
+
 def apply_setting(name, raw):
-    if not hasattr(cfg, name):
-        print(f"Нет такой настройки: {name}. Введи 'edit' для списка с описаниями.")
+    if name not in vars(cfg):
+        print(f"Нет такой настройки: {name}. Введи 'help' для списка с описаниями.")
         return
     try:
         value = coerce_setting(name, raw)
-    except ValueError as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         print(paint("не принято:", "red"), f"{name} — {exc}")
         return
     error = bounds_error(name, value)
@@ -1668,7 +1869,7 @@ SETTINGS_GROUPS = [
         ("global_motion_limit", "доля изменившегося кадра, выше которой это разворот камеры, а не цель"),
     )),
     ("Прицел на рабочем столе", (
-        ("lock_radius",       "радиус залипания на прежнюю цель, px (0 = выкл, всегда крупнейшее пятно)"),
+        ("lock_radius",       "радиус сопоставления с прежней целью, px (0 = без удержания)"),
         ("lock_timeout",      "через сколько секунд без детекций прежняя цель забывается"),
         ("move_smoothing",    "доля пути до цели за кадр: 1.0 = мгновенно, 0.3 = плавно для записи"),
         ("dead_zone",         "не двигать курсор, если цель ближе стольких пикселей"),
@@ -1681,7 +1882,7 @@ SETTINGS_GROUPS = [
         ("margin_preview",    "сколько показывать квадрат области после смены margin, сек"),
     )),
     ("Режимы и вывод", (
-        ("overlay_enabled",   "рамка оверлея: on = точнее и медленнее, off = быстрый режим (F7)"),
+        ("overlay_enabled",   "рамка оверлея: on = синхронно, off = фоновый захват (F7)"),
         ("auto_click",        "кликать после наведения (F6)"),
         ("click_interval",    "минимальная пауза между кликами, сек: 0 = на каждой детекции"),
         ("click_tolerance",   "кликать, только когда цель ближе стольких пикселей к прицелу"),
@@ -1697,6 +1898,21 @@ SETTINGS_GROUPS = [
         ("dump_key",          "клавиша сброса накопленных кадров на диск"),
     )),
 ]
+
+SETTINGS_GROUPS.append(
+    ('Проверка и фильтры',
+     (('observe_only', 'наблюдение без движений и кликов'),
+      ('require_game_window', 'пауза, когда выбранное окно игры неактивно'),
+      ('confirm_frames', 'сколько последовательных детекций подтверждают цель'),
+      ('max_blob_fraction', 'максимальная доля полезной области, занятая пятном'),
+      ('max_aspect_ratio', 'максимальное отношение длинной стороны пятна к короткой'),
+      ('ignore_bottom_fraction', 'исключённая нижняя доля окна игры, 0..0.9'),
+      ('exclusion_rects', 'исключённые области окна: JSON-прямоугольники 0..1'),
+      ('compensate_camera', 'экспериментальная компенсация общего сдвига'),
+      ('max_frame_age', 'предельный возраст кадра для ввода, сек'),
+      ('pair_interval', 'интервал захвата кадров, сек'),
+      ('max_mouse_step', 'максимальная длина относительного движения за действие')))
+)
 
 SETTINGS_INFO = {name: desc for _, items in SETTINGS_GROUPS for name, desc in items}
 
@@ -1763,8 +1979,8 @@ def print_settings_menu():
 
 
 def describe_setting(name):
-    if not hasattr(cfg, name):
-        print(f"Нет такой настройки: {name}. Введи 'edit' для списка.")
+    if name not in vars(cfg):
+        print(f"Нет такой настройки: {name}. Введи 'help' для списка.")
         return
     value = getattr(cfg, name)
     hint = range_hint(name, value)
@@ -1786,37 +2002,9 @@ def describe_setting(name):
 # Подробные объяснения: одной строки в 'edit' хватает, чтобы вспомнить, но не
 # чтобы понять впервые. Это показывает 'set <имя>' без значения.
 SETTINGS_HELP = {
-    "overlay_enabled": """\
-Выбор между двумя способами захвата экрана — это главная развилка в скрипте.
+    'overlay_enabled': 'ВКЛ (рамка): синхронный захват с ожиданием скрытия рамок и интервалом pair_interval между кадрами. ВЫКЛ (быстрый): фоновые кадры с ограничением частоты захвата. Оба режима используют один детектор. Рамки удобны для настройки, но добавляют задержку. Предпросмотр в панели доступен в обоих режимах.',
 
-ВКЛ (рамка). Перед каждой парой скриншотов рамка синхронно прячется, кадры
-снимаются подряд из главного потока, потом рамка рисуется заново. Так рамка
-не попадает в собственный скриншот (иначе она считалась бы изменением и
-разрасталась по кругу — это был настоящий баг). Зато каждый цикл ждёт
-перерисовки окна, и реакция медленнее.
-
-ВЫКЛ (быстрый). Рамки нет, зато отдельный поток непрерывно снимает экран, а
-главный цикл просто берёт последний готовый кадр, не ожидая захвата. Это
-быстрее, но съедает одно ядро процессора целиком, пока включено.
-
-Коротко: рамка нужна, когда подбираешь diff_threshold и min_blob_area и
-хочешь видеть, что скрипт считает целью. Для самой работы выключай.""",
-
-    "aim_mode": """\
-Как двигать мышь. Способов два, и в игре работает только один.
-
-absolute — курсор ставится в точку экрана. Так делает pyautogui, и
-на рабочем столе это работает. Но игра, захватившая курсор и читающая raw input
-(Minecraft в их числе), такого движения не видит вообще: оно не проходит
-через очередь ввода. Отсюда брался симптом "персонаж бьёт воздух, камера
-стоит".
-
-relative — мышь сдвигается на столько-то отсчётов, как настоящая мышь.
-Это игра видит. Прицел при этом считается не от курсора (его позиция под
-захватом ничего не значит), а от центра игрового окна.
-
-auto — relative, пока активно окно игры, absolute в остальное время. Так
-работает и в игре, и на рабочем столе, без переключений вручную.""",
+    'aim_mode': 'auto выбирает относительные движения в активном окне игры. relative всегда использует относительные отсчёты мыши, absolute — положение курсора. По умолчанию require_game_window запрещает действия вне игры; observe_only запрещает весь ввод независимо от режима.',
 
     "camera_gain": """\
 Насколько резко доворачивать камеру за кадр, от 0.01 до 5.
@@ -1832,17 +2020,7 @@ auto — relative, пока активно окно игры, absolute в ост
 Подбирай так: начни с 0.5, при перелётах уменьшай вдвое, при вялости
 увеличивай на треть.""",
 
-    "lock_radius": """\
-Радиус залипания на прежнюю цель, в пикселях. 0 — выключить.
-
-Без залипания целью каждый кадр становится просто самое крупное пятно
-изменений. Как только два пятна меняются площадями местами, курсор прыгает
-между ними — на записи это выглядит как дёрганье.
-
-С залипанием: если прежняя цель ещё свежая (прошло меньше lock_timeout) и в
-этом радиусе от неё есть пятно, держимся за него, а не за самое большое.
-Больше радиус — упорнее держимся за одну цель, но легче "прилипнуть" к
-соседнему пятну. Меньше — охотнее переключаемся на новое.""",
+    'lock_radius': 'Верхняя граница расстояния для сопоставления новой детекции с прежней целью, px. Учитываются также размер и площадь пятна. Новая цель выбирается по близости к прицелу с ограниченным бонусом площади. 0 отключает удержание, но подтверждение confirm_frames сохраняется.',
 
     "diff_threshold": """\
 Насколько сильно пиксель должен измениться, чтобы считаться изменением.
@@ -2075,43 +2253,11 @@ margin. 0 — не показывать.
 запуски до перезагрузки показывают сохранённые цифры. Выключи, если замер
 мешает; перемерить вручную всегда можно командой bench.""",
 
-    "tune_mode": """\
-Отладочный режим для подбора настроек. Выключен по умолчанию.
+    'tune_mode': 'Запись точных исходных пар кадров, маски и решений, включая отказы. F9 сохраняет буфер для офлайн-повтора. F8 всегда останавливает программу и ничего не удаляет. Запись может увеличить задержку; предел буфера 256 МиБ.',
 
-Каждая детекция снимает ВЕСЬ экран, размечает его и кладёт в кольцевой
-буфер последних tune_frames кадров. Разметка:
+    'tune_frames': 'Максимальное число исходных пар кадров в буфере записи, от 1 до 60. Пары сохраняются без потерь. Дополнительно действует предел 256 МиБ, поэтому при большом разрешении история может быть короче.',
 
-  зелёный  — цель, на которую пойдёт курсор
-  жёлтый   — прошли порог площади, но не выбраны
-  серый    — отсеяны min_blob_area
-  голубой  — граница области слежения
-
-В углу панель: версия, режим, размеры экрана и три главных порога, а ниже
-координаты цели, её площадь, число пятен и время реакции. Время меряется
-ДО разметки и записи — иначе цифра врала бы именно о том, что ты
-настраиваешь.
-
-Клавиша dump_key пишет буфер на диск, каждый сброс в свою папку внутри
-tune/. Клавиша остановки в этом режиме не завершает работу, а ставит паузу:
-успеваешь скопировать нужные кадры, повторное нажатие стирает папку и
-продолжает.
-
-Режим заведомо медленнее боевого: съёмка всего экрана, отрисовка и
-кодирование стоят десятков миллисекунд на кадр.""",
-
-    "tune_frames": """\
-Сколько последних размеченных кадров держать в памяти для сброса на диск.
-
-Хранятся сжатыми в JPEG, два десятка кадров — это порядка десятка мегабайт.
-Больше значение — длиннее история перед интересным моментом, но и памяти
-больше.""",
-
-    "dump_key": """\
-Клавиша, которая пишет накопленные отладочные кадры на диск.
-
-Каждое нажатие создаёт внутри tune/ папку с отметкой времени, так что
-предыдущие сбросы не затираются. Работает только в отладочном режиме —
-в боевом буфер не наполняется.""",
+    'dump_key': 'F9 сохраняет накопленные исходные пары кадров в новую папку tune/. Если запись выключена, первое нажатие включает её, следующее сохраняет. Старые записи автоматически не удаляются.',
 
     "pause_on_start": """\
 Ждать Enter после стартового вывода, перед началом слежения.
@@ -2191,6 +2337,38 @@ tune/. Клавиша остановки в этом режиме не заве�
 }
 
 
+
+SETTINGS_HELP.update(
+    {'observe_only': 'При каждом запуске и загрузке профиля включено наблюдение. Сначала '
+                     'проверь рамки и маску; set observe_only off разрешает ввод только в '
+                     'активном окне игры.',
+     'require_game_window': 'По умолчанию on. При Alt+Tab ввод останавливается и история '
+                            'кадров сбрасывается. Выключать только для явного эксперимента с '
+                            'рабочим столом.',
+     'confirm_frames': 'Два подтверждения уменьшают одиночные ложные срабатывания. Для '
+                       'коротких частиц можно поставить 1 после проверки на записях; большее '
+                       'значение повышает задержку.',
+     'max_blob_fraction': 'Крупные изменения часто связаны со сценой или рукой. 0.15 '
+                          'отбрасывает пятна больше 15% полезной области. Настрой под размер '
+                          'нужного события.',
+     'max_aspect_ratio': 'Отсекает длинные полосы и границы. Большее значение пропускает '
+                         'вытянутые цели. Минимум 1.',
+     'ignore_bottom_fraction': 'Например 0.15 скрывает от детекции нижние 15% окна. Маска '
+                               'относится к окну игры, а не к квадрату Ctrl; по умолчанию 0.',
+     'exclusion_rects': 'Формат [[лево,верх,право,низ], ...]. Например [[0.6,0.6,1,1]] '
+                        'исключает правый нижний участок с рукой. Координаты относительны к '
+                        'клиентской области игры.',
+     'compensate_camera': 'Оценивает общий перенос изображения. При ненадёжной оценке ввод '
+                          'запрещён. Не компенсирует перспективу, параллакс и масштаб. По '
+                          'умолчанию off; сравнивай на записях.',
+     'max_frame_age': 'Кадры старше этого значения не управляют мышью. 0.1 означает 100 мс. '
+                      'Отладочная запись и обработка тоже учитываются перед вводом.',
+     'pair_interval': '0.016 соответствует примерно 60 парам отсчётов в секунду в быстром '
+                      'режиме. Синхронный режим дополнительно ждёт скрытия рамок. Частота '
+                      'проверок не равна частоте новых кадров игры.',
+     'max_mouse_step': 'Ограничивает резкие развороты. Это отсчёты мыши, не угол камеры; '
+                       'зависит от чувствительности игры.'}
+)
 
 LIST_ITEM = re.compile(r"^(\s*)((?:\d+\.|[-*])\s+)(.*)$")
 
@@ -2273,24 +2451,24 @@ def pick_window():
 
     choice = int(answer)
     if choice == 0:
-        cfg.window_exe = ""
-        cfg.window_title = ""
+        with _state_lock:
+            cfg.window_exe = ""
+            cfg.window_title = ""
+            _selected_hwnd[0] = None
+            reset_tracking()
         print(paint("[Окно]", "green"), "привязка снята, прицел в центре экрана.")
         return
 
-    _hwnd, title, exe, _rect = windows[choice - 1]
-    if exe:
+    hwnd, title, exe, _rect = windows[choice - 1]
+    with _state_lock:
+        _selected_hwnd[0] = hwnd
         cfg.window_exe = exe
-        cfg.window_title = ""
-        print(paint("[Окно]", "green"), f"привязано к {exe}")
-    else:
-        # имя процесса не отдалось (бывает с окнами от системы) — остаётся заголовок
-        cfg.window_exe = ""
-        cfg.window_title = title.split()[0] if title.split() else title
-        print(paint("[Окно]", "yellow"),
-              f"имя процесса недоступно, привязываюсь по слову {cfg.window_title!r}")
-    _window_cache["ts"] = 0.0
-    update_aim_context()
+        cfg.window_title = title
+        _runtime["dirty"] = True
+        _window_cache["ts"] = 0.0
+        reset_tracking()
+        update_aim_context()
+    print(paint("[Окно]", "green"), f"выбрано окно {title!r}")
 
 
 def print_window_info():
@@ -2420,27 +2598,50 @@ def remember_tune_frame(canvas):
     del _tune["frames"][:-limit]
 
 
-def capture_tune_frame(blobs, primary, region, mode_name, reaction_ms):
-    """Снимает весь экран, размечает и кладёт в буфер.
-
-    Снимаем целиком даже в режиме Ctrl, где детекция смотрит только квадрат:
-    по вырезанному квадрату без окружения непонятно, что происходило, а
-    границу области рисуем отдельной рамкой.
-    """
-    if not cfg.tune_mode:
-        return
+def capture_tune_frame(blobs, primary, region, mode_name, reaction_ms, frame=None, mask=None):
+    """Render exact detector inputs at at most 10 Hz; recording is separate."""
+    if frame is None or not (cfg.tune_mode or _panel is not None):
+        return True
+    now = time.perf_counter()
+    if now < _preview_next[0]:
+        return True
+    _preview_next[0] = now + 0.1
     try:
-        whole = {"left": 0, "top": 0, "width": screen_width, "height": screen_height}
-        frame = np.array(main_sct.grab(whole), dtype=np.uint8)
-        canvas = annotate_tune_frame(frame, (region[0], region[1]), blobs, primary,
-                                     region, mode_name, reaction_ms)
-        remember_tune_frame(canvas)
-    except Exception as exc:              # noqa: BLE001 — отладке ронять цикл незачем
-        print(paint("[Отладка]", "red"), f"кадр не снят: {exc}")
-
+        local_region = (0, 0, frame.shape[1], frame.shape[0])
+        canvas = annotate_tune_frame(frame, (0, 0), blobs, primary, local_region,
+                                     mode_name, reaction_ms)
+        if cfg.tune_mode:
+            remember_tune_frame(canvas)
+        if _panel is None:
+            return True
+        # Right-hand pane shows the exact binary mask; no PNG work without GUI.
+        if mask is not None:
+            shown_mask = cv2.cvtColor((mask > 0).astype(np.uint8) * 255, cv2.COLOR_GRAY2BGR)
+            canvas = np.concatenate((canvas, shown_mask), axis=1)
+        ratio = min(1.0, 900 / canvas.shape[1], 450 / canvas.shape[0])
+        if ratio < 1:
+            canvas = cv2.resize(canvas, None, fx=ratio, fy=ratio, interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".png", canvas)
+        if not ok:
+            raise RuntimeError("кодирование предпросмотра не удалось")
+        import base64
+        _runtime["preview"] = base64.b64encode(encoded).decode("ascii")
+        return True
+    except Exception as exc:
+        _runtime["paused"] = True
+        _runtime["error"] = f"Предпросмотр: {exc}"
+        return False
 
 def dump_tune_frames():
     """Пишет накопленные кадры на диск, каждый сброс — в свою папку."""
+    if len(_recorder):
+        try:
+            folder = _recorder.dump(os.path.join(SCRIPT_DIR, TUNE_DIR))
+            print(f"[Запись] Исходные пары кадров -> {folder}")
+        except (OSError, ValueError) as exc:
+            _runtime["error"] = str(exc)
+            print(f"[Запись] Не удалось сохранить: {exc}")
+        return
     frames = list(_tune["frames"])
     if not frames:
         print(paint("[Отладка]", "yellow"), "кадров пока нет.")
@@ -2479,22 +2680,10 @@ def clear_tune_dir():
 
 
 def tune_pause_toggle():
-    """Клавиша стоп в отладочном режиме: сперва пауза, потом очистка папки.
-
-    Пауза нужна, чтобы успеть скопировать нужные кадры к себе: повторное
-    нажатие папку стирает. В обычном режиме та же клавиша по-прежнему
-    завершает работу.
-    """
-    if not _tune["paused"]:
-        _tune["paused"] = True
-        print(paint("[Отладка]", "yellow"),
-              f"пауза. Скопируй нужное из {TUNE_DIR}; "
-              f"{cfg.panic_key.upper()} ещё раз — очистить папку и продолжить.")
-        return
-    clear_tune_dir()
-    _tune["paused"] = False
-    print(paint("[Отладка]", "green"), "продолжаю.")
-
+    """Pause/resume never deletes evidence. F8 always stops independently."""
+    _tune["paused"] = not _tune["paused"]
+    reset_tracking()
+    print("[Отладка] " + ("пауза" if _tune["paused"] else "продолжаю"))
 
 # ---------- Конфиг: профили настроек ----------
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aim_config.json")
@@ -2509,7 +2698,7 @@ _config = {"data": None, "active": DEFAULT_PROFILE_NAME, "autosave_ok": True}
 # Конфиг трогают два потока: консольный (команды profile/reset_config) и
 # главный (автосохранение при выходе). RLock, потому что операции вложены —
 # profile_delete внутри себя зовёт save_config_file.
-_config_lock = threading.RLock()
+_config_lock = _state_lock
 
 
 
@@ -2539,6 +2728,19 @@ def load_config_file():
             data = json.load(handle)
         if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
             raise ValueError("нет секции profiles")
+        if data.get("version", 1) != 1:
+            raise ValueError("неподдерживаемая версия конфига")
+        valid = {}
+        for name, values in data["profiles"].items():
+            if isinstance(name, str) and name.strip() and isinstance(values, dict):
+                valid[name] = values
+            else:
+                print(f"[Конфиг] Некорректный профиль {name!r} пропущен.")
+        data["profiles"] = valid
+        if not isinstance(data.get("default_profile", DEFAULT_PROFILE_NAME), str):
+            data["default_profile"] = DEFAULT_PROFILE_NAME
+        if not isinstance(data.get("bench", {}), dict):
+            data["bench"] = {}
     except (OSError, ValueError) as exc:
         print(f"[Конфиг] {CONFIG_PATH} не читается ({exc}).")
         try:
@@ -2555,15 +2757,29 @@ def load_config_file():
 
 def save_config_file():
     with _config_lock:
+        temporary = None
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
-                json.dump(_config["data"], handle, ensure_ascii=False, indent=2, sort_keys=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(CONFIG_PATH),
+                                             prefix=".aim_config-", suffix=".tmp", delete=False) as handle:
+                temporary = handle.name
+                json.dump(_config["data"], handle, ensure_ascii=False, indent=2, sort_keys=True,
+                          allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if os.path.isfile(CONFIG_PATH):
+                shutil.copy2(CONFIG_PATH, CONFIG_PATH + ".bak")
+            os.replace(temporary, CONFIG_PATH)
             return True
-        except OSError as exc:
+        except (OSError, ValueError, TypeError) as exc:
+            _runtime["error"] = str(exc)
             print(f"[Конфиг] Не могу записать {CONFIG_PATH}: {exc}")
             return False
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
 
 
+@state_locked
 def current_values():
     return dict(vars(cfg))
 
@@ -2572,20 +2788,44 @@ def profile_names():
     return sorted(_config["data"]["profiles"])
 
 
+@state_locked
 def apply_values(values):
     """Загружает набор значений в cfg, пропуская всё, что не проходит проверку.
 
     Значения идут через те же coerce/bounds, что и команда 'set': файл
     правится руками, и одна опечатка не должна ронять запуск.
     """
+    if not isinstance(values, dict):
+        print("[Конфиг] Ожидался объект настроек; профиль пропущен.")
+        return
     skipped = []
+    # Validate hotkeys against their FINAL mapping so profiles may swap keys.
+    bindings = {name: getattr(cfg, name) for name in KEY_SETTINGS}
+    supplied_keys = False
+    for name in KEY_SETTINGS:
+        if name in values:
+            supplied_keys = True
+            try:
+                bindings[name] = coerce_setting(name, values[name], key_bindings={})
+            except (ValueError, TypeError):
+                skipped.append(f"{name} (неподдерживаемая клавиша)")
+    if supplied_keys:
+        if len(set(bindings.values())) != len(bindings):
+            skipped.append("клавиши (повторяющиеся назначения)")
+        else:
+            for name, value in bindings.items():
+                setattr(cfg, name, value)
+            rebind_hotkeys()
+            reset_tracking()
     for name, raw in values.items():
-        if not hasattr(cfg, name):
+        if name in KEY_SETTINGS:
+            continue
+        if name not in vars(cfg):
             skipped.append(f"{name} (нет такой настройки)")
             continue
         try:
             value = coerce_setting(name, raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             skipped.append(f"{name} (не разобрать {raw!r})")
             continue
         error = bounds_error(name, value)
@@ -2611,6 +2851,7 @@ def profile_save(name=None):
         _config["active"] = name
         _config["autosave_ok"] = True
         if save_config_file():
+            _runtime["dirty"] = False
             print(f"[Профиль] Сохранён: {name}")
 
 
@@ -2620,9 +2861,13 @@ def profile_load(name):
         if values is None:
             print(f"[Профиль] Нет профиля {name!r}. 'profiles' — список.")
             return
+        apply_values(builtin_defaults())
         apply_values(values)
+        cfg.observe_only = True
+        reset_tracking()
         _config["active"] = name
         _config["autosave_ok"] = True
+        _runtime["dirty"] = False
         print(f"[Профиль] Загружен: {name}")
 
 
@@ -2643,7 +2888,16 @@ def profile_delete(name):
         if _config["data"]["default_profile"] == name:
             _config["data"]["default_profile"] = DEFAULT_PROFILE_NAME
         if _config["active"] == name:
-            _config["active"] = _config["data"]["default_profile"]
+            replacement = _config["data"]["default_profile"]
+            if replacement not in _config["data"]["profiles"]:
+                replacement = next(iter(sorted(_config["data"]["profiles"])), DEFAULT_PROFILE_NAME)
+            apply_values(builtin_defaults())
+            apply_values(_config["data"]["profiles"].get(replacement, {}))
+            cfg.observe_only = True
+            _config["active"] = replacement
+            if replacement not in _config["data"]["profiles"]:
+                _config["data"]["profiles"][replacement] = current_values()
+            _runtime["dirty"] = False
         if save_config_file():
             print(f"[Профиль] Удалён: {name}")
 
@@ -2781,7 +3035,7 @@ def startup_load_config():
     data = load_config_file()
     if data is None:
         _config["data"] = empty_config()
-        cfg.margin = ask_margin()
+        cfg.margin = cfg.margin if _gui_requested else ask_margin()
         _config["data"]["profiles"][DEFAULT_PROFILE_NAME] = current_values()
         if save_config_file():
             print(f"[Конфиг] Создан {CONFIG_PATH}")
@@ -2882,19 +3136,114 @@ def print_header():
         title, (left, top, w, h) = last
         where = f"{title}  {w}x{h} @ ({left}, {top})"
     print(f"  профиль {paint(_config['active'], 'bold')}    {where}")
-    mode = "рамка (точнее)" if cfg.overlay_enabled else "быстрый (без рамки)"
+    mode = "с рамками" if cfg.overlay_enabled else "быстрый (без рамки)"
     click = paint("вкл", "yellow") if cfg.auto_click else "выкл"
     print(f"  захват {paint(mode, 'bold')}    автоклик {click}")
     print()
-    print(f"  {paint('help', 'cyan')} — команды   {paint('edit', 'cyan')} — настройки   "
+    print(f"  {paint('help', 'cyan')} — команды   {paint('set <имя>', 'cyan')} — настройки   "
           f"{paint('window', 'cyan')} — привязка к окну")
     print(f"  {paint('help режимы', 'cyan')} — что такое захват   "
           f"{paint('set <имя>', 'cyan')} — разбор настройки")
     print(rule)
 
 
+def refresh_panel_windows():
+    _runtime["windows"] = [{"id": hwnd, "title": title, "exe": exe}
+                           for hwnd, title, exe, _rect in list_windows()]
+
+
+@state_locked
+def handle_engine_command(command):
+    """UI and hotkeys enqueue work; changes apply between detection iterations."""
+    kind = command.get("command")
+    _runtime["error"] = ""
+    try:
+        if kind == "set_many":
+            apply_settings_batch(command.get("settings"))
+        elif kind == "set":
+            name = command.get("name")
+            if name not in vars(cfg):
+                raise ValueError("неизвестная настройка")
+            value = coerce_setting(name, command.get("value"))
+            error = bounds_error(name, value)
+            if error:
+                raise ValueError(error)
+            assign_setting(name, value)
+        elif kind == "select_window":
+            hwnd = command.get("id")
+            window = next((w for w in _runtime["windows"] if str(w["id"]) == str(hwnd)), None)
+            if window is None:
+                raise ValueError("окно уже недоступно; обновите список")
+            _selected_hwnd[0] = window["id"]
+            cfg.window_exe, cfg.window_title = window["exe"], window["title"]
+            _runtime["dirty"] = True
+            reset_tracking()
+        elif kind == "profile_load":
+            name = str(command.get("name", ""))
+            if name not in profile_names():
+                raise ValueError("профиль не найден")
+            profile_load(name)
+        elif kind == "profile_save":
+            name = str(command.get("name", "")).strip()
+            if not name or len(name) > 80 or any(c in name for c in "\r\n"):
+                raise ValueError("имя профиля: от 1 до 80 символов")
+            profile_save(name)
+        elif kind in ("pause", "resume"):
+            _runtime["paused"] = kind == "pause"
+            _tune["paused"] = False
+            reset_tracking()
+        elif kind == "stop":
+            panic_stop()
+        elif kind == "record":
+            if not cfg.tune_mode:
+                cfg.tune_mode = True
+                _runtime["dirty"] = True
+                _runtime["reason"] = "запись включена; F9 — сохранить буфер"
+            else:
+                dump_tune_frames()
+        elif kind == "toggle_click":
+            toggle_autoclick()
+            _runtime["dirty"] = True
+        elif kind == "toggle_overlay":
+            set_overlay_enabled(not cfg.overlay_enabled)
+        elif kind == "refresh":
+            refresh_panel_windows()
+        else:
+            raise ValueError("неизвестная команда панели")
+    except (ValueError, TypeError, OSError, OverflowError) as exc:
+        _runtime["error"] = str(exc)
+
+
+@state_locked
+def publish_panel():
+    if _panel is None:
+        return
+    status = ("пауза" if _runtime["paused"] or _tune["paused"] else
+              "окно неактивно" if cfg.require_game_window and _aim["viewport"] is None else
+              "наблюдение" if cfg.observe_only else "слежение")
+    _panel.publish({"status": status, "profile": _config["active"],
+                    "profiles": profile_names(), "settings": current_values(),
+                    "windows": _runtime["windows"], "dirty": _runtime["dirty"],
+                    "window_id": _selected_hwnd[0] or _aim["hwnd"],
+                    "target": _stat["target"], "reason": _runtime["reason"],
+                    "latency_ms": _stat["ms"], "frame_age_ms": _runtime["frame_age_ms"],
+                    "preview": _runtime["preview"], "error": _runtime["error"]})
+
+
+def intersect_region(region, viewport):
+    if viewport is None:
+        return region
+    x, y, w, h = region
+    vx, vy, vw, vh = viewport
+    x1, y1 = max(x, vx), max(y, vy)
+    x2, y2 = min(x + w, vx + vw), min(y + h, vy + vh)
+    return (x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+
+
 _vt["ok"] = enable_vt()     # до любого цветного вывода: иначе первые строки выйдут серыми
 startup_load_config()
+cfg.observe_only = True  # every launch starts without mouse input, including old profiles
+_runtime["dirty"] = False
 set_overlay_enabled(cfg.overlay_enabled)  # запускает грабер, если оверлей выключен
 rebind_hotkeys()            # переключатели вешаются на клавиши из настроек
 update_aim_context()        # чтобы шапка показала реальную привязку, а не "окно не найдено"
@@ -2904,40 +3253,67 @@ print_header()
 # следом бенчмарк своим save_config_file() воскрешал только что удалённый файл.
 maybe_run_startup_benchmark()
 
-if cfg.pause_on_start:
+if cfg.pause_on_start and not _gui_requested:
     # до старта консольного потока: иначе он перехватил бы этот же Enter
     try:
         input("\n[Пауза] Enter — начать слежение ('set pause_on_start off' уберёт паузу)...")
     except EOFError:
         pass
 
-threading.Thread(target=console_loop, daemon=True).start()
+if _gui_requested:
+    _panel = PanelBridge(os.path.join(SCRIPT_DIR, "aim_ui.py"), sys.executable).start()
+    refresh_panel_windows()
+    publish_panel()
+else:
+    threading.Thread(target=console_loop, daemon=True).start()
 
 
 _status_next = [0.0]
 _was_tracking = [False]
+_panel_next = 0.0
+_was_active = False
 
 try:
     while not _stop.is_set():
+        if _panel is not None:
+            for command in _panel.drain():
+                handle_engine_command(command)
+            if not _panel.alive:
+                panic_stop()
+        for _ in range(32):
+            try:
+                handle_engine_command(_engine_commands.get_nowait())
+            except queue.Empty:
+                break
+        if _stop.is_set():
+            break
         found = False
         tracking_key = None
+        _runtime["held_key"] = None
         # прицел и способ движения пересчитываем каждую итерацию: окно игры
         # можно свернуть, подвинуть или переключиться из него в другое
         viewport = update_aim_context()
 
-        if _tune["paused"]:
-            tracking_key = None       # на паузе ничего не снимаем и не двигаем
+        if _runtime["paused"] or _tune["paused"]:
+            _runtime["reason"] = "пауза"
+            tracking_key = None
+        elif cfg.require_game_window and viewport is None:
+            _runtime["reason"] = "выбранное окно игры неактивно"
+            tracking_key = None
         elif is_key_held(cfg.track_key):
             tracking_key = cfg.track_key.capitalize()
+            _runtime["held_key"] = cfg.track_key
             _detect["mode"] = "Margin"
             # снимок на итерацию: margin правится из консоли прямо во время работы
             margin = int(cfg.margin)
             cross_x, cross_y = _aim["crosshair"]
             left, top, width, height = clamp_region(
                 cross_x - margin, cross_y - margin, margin * 2, margin * 2)
+            left, top, width, height = intersect_region((left, top, width, height), viewport)
             found = track(left, top, width, height, offset_x=left, offset_y=top)
         elif is_key_held(cfg.fullscreen_key):
             tracking_key = cfg.fullscreen_key.capitalize()
+            _runtime["held_key"] = cfg.fullscreen_key
             _detect["mode"] = "Fullscreen"
             # когда игра идёт в окне, незачем разглядывать остальной рабочий стол
             if viewport is None:
@@ -2946,6 +3322,19 @@ try:
                 left, top, width, height = clamp_region(*viewport)
             found = track(left, top, width, height, offset_x=left, offset_y=top)
 
+        if tracking_key is None:
+            if _was_active:
+                reset_tracking()
+            _was_active = False
+            _stat["motion"] = 0.0
+        else:
+            _was_active = True
+        if grabber.error:
+            _runtime["paused"] = True
+            _runtime["error"] = "Захват экрана: " + grabber.error
+        if _panel is not None and time.perf_counter() >= _panel_next:
+            _panel_next = time.perf_counter() + 0.15
+            publish_panel()
         if not found and cfg.overlay_enabled and not overlay_is_held():
             overlay.hide_all_and_wait()
         if not found:
@@ -2975,6 +3364,14 @@ except KeyboardInterrupt:
     print(paint("\n[Стоп] Прервано с клавиатуры.", "yellow"))
 finally:
     clear_status()
-    grabber.stop()
+    try:
+        grabber.stop()
+    except RuntimeError as exc:
+        print(f"[Захват] {exc}")
+    if _panel is not None:
+        _panel.close()
+    close_capture = getattr(main_sct, "close", None)
+    if close_capture is not None:
+        close_capture()
     if cfg.autosave and _config["data"] is not None and _config["autosave_ok"]:
         profile_save(_config["active"])

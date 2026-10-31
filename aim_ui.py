@@ -172,8 +172,7 @@ class SettingsModel:
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{LABELS.get(name, name)}: {exc}") from exc
         # Validate the entire batch before clearing edits or emitting anything.
-        commands = [{"command": "set", "name": name, "value": value}
-                    for name, value in parsed.items()]
+        commands = [{"command": "set_many", "settings": parsed}] if parsed else []
         self.pending.update(parsed)
         self.edits.clear()
         return commands

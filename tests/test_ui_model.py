@@ -23,7 +23,7 @@ class SettingsModelTests(unittest.TestCase):
         model = SettingsModel()
         model.receive({"settings": {"confirm_frames": 2}})
         model.edit("confirm_frames", "3")
-        self.assertEqual(model.commands(), [{"command": "set", "name": "confirm_frames", "value": 3}])
+        self.assertEqual(model.commands(), [{"command": "set_many", "settings": {"confirm_frames": 3}}])
         model.receive({"settings": {"confirm_frames": 2}})
         self.assertEqual(model.displayed("confirm_frames"), 3)
         model.receive({"settings": {"confirm_frames": 3}})

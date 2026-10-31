@@ -20,7 +20,11 @@ if not defined PY set "PY=py"
 
 echo [run.bat] Интерпретатор: %PY%
 echo.
-"%PY%" aim_tracker.py
+if "%~1"=="" (
+    "%PY%" aim_tracker.py --gui
+) else (
+    "%PY%" aim_tracker.py %*
+)
 set "CODE=%ERRORLEVEL%"
 
 echo.
