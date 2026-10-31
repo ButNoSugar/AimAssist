@@ -19,6 +19,13 @@ MAIN_SETTINGS = (
     "confirm_frames", "click_interval", "auto_click",
 )
 LABELS = {
+    "require_game_window": "Работать только с выбранным окном",
+    "max_blob_fraction": "Максимальная доля площади пятна",
+    "max_aspect_ratio": "Максимальная вытянутость пятна",
+    "ignore_bottom_fraction": "Исключить нижнюю долю окна / области",
+    "max_frame_age": "Предельный возраст кадра, с",
+    "pair_interval": "Интервал между кадрами, с",
+    "max_mouse_step": "Максимальное движение мыши за шаг",
     "observe_only": "Наблюдать без управления мышью",
     "diff_threshold": "Порог изменения пикселей (0–255)",
     "min_blob_area": "Минимальная площадь, px",
@@ -76,6 +83,11 @@ MAXIMUMS = {
     "global_motion_limit": 1, "status_hz": 60,
 }
 CHOICES = {"aim_mode": ("auto", "absolute", "relative"), "color": ("auto", "on", "off")}
+WORK_MODES = {"Выбранное окно": "window", "Рабочий стол (основной экран)": "desktop"}
+
+
+def setting_matches(name: str, query: str) -> bool:
+    return query.strip().casefold() in (name + " " + LABELS.get(name, name)).casefold()
 
 
 def value_text(value: Any) -> str:
@@ -190,6 +202,7 @@ class ControlPanel:
         self.model = SettingsModel()
         self.incoming: queue.Queue = queue.Queue(maxsize=2)
         self.variables: dict[str, Any] = {}
+        self.all_rows: dict[str, Any] = {}
         self.window_ids: list[Any] = []
         self.updating = False
         self.profile_editing = False
@@ -214,20 +227,29 @@ class ControlPanel:
         selectors = ttk.Frame(outer)
         selectors.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         selectors.columnconfigure(1, weight=1)
-        ttk.Label(selectors, text="Окно игры").grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(selectors, text="Рабочая область").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.work_mode = tk.StringVar(value="Выбранное окно")
+        self.mode_picker = ttk.Combobox(selectors, textvariable=self.work_mode,
+                                       values=list(WORK_MODES), state="readonly")
+        self.mode_picker.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        self.mode_picker.bind("<<ComboboxSelected>>", self.select_mode)
+        ttk.Label(selectors, text="Открытые окна").grid(row=1, column=0, padx=(0, 8))
         self.windows = ttk.Combobox(selectors, state="readonly", width=45)
-        self.windows.grid(row=0, column=1, sticky="ew")
+        self.windows.grid(row=1, column=1, sticky="ew")
         self.windows.bind("<<ComboboxSelected>>", self.select_window)
         ttk.Button(selectors, text="Обновить", command=lambda: self.send("refresh")).grid(
-            row=0, column=2, padx=6)
-        ttk.Label(selectors, text="Профиль").grid(row=1, column=0, sticky="w", pady=6)
+            row=1, column=2, padx=6)
+        self.window_hint = tk.StringVar(value="Получаю список открытых окон…")
+        ttk.Label(selectors, textvariable=self.window_hint, wraplength=760).grid(
+            row=2, column=1, columnspan=2, sticky="w", pady=3)
+        ttk.Label(selectors, text="Профиль").grid(row=3, column=0, sticky="w", pady=6)
         self.profile = tk.StringVar()
         self.profiles = ttk.Combobox(selectors, textvariable=self.profile, width=25)
-        self.profiles.grid(row=1, column=1, sticky="ew", pady=6)
+        self.profiles.grid(row=3, column=1, sticky="ew", pady=6)
         self.profiles.bind("<KeyRelease>", lambda event: setattr(self, "profile_editing", True))
         self.profiles.bind("<<ComboboxSelected>>", lambda event: setattr(self, "profile_editing", True))
         actions = ttk.Frame(selectors)
-        actions.grid(row=1, column=2, sticky="w")
+        actions.grid(row=3, column=2, sticky="w")
         ttk.Button(actions, text="Загрузить", command=lambda: self.profile_command("profile_load")).pack(side="left")
         ttk.Button(actions, text="Сохранить", command=lambda: self.profile_command("profile_save")).pack(side="left", padx=4)
 
@@ -238,7 +260,9 @@ class ControlPanel:
         notebook = ttk.Notebook(settings)
         notebook.pack(fill="both", expand=True)
         self.main_fields = self.scrollable_tab(notebook, "Основное")
-        self.advanced_fields = self.scrollable_tab(notebook, "Дополнительно")
+        self.search = tk.StringVar()
+        self.all_fields = self.scrollable_tab(notebook, "Все настройки", searchable=True)
+        self.search.trace_add("write", lambda *args: self.filter_settings())
         self.dirty = tk.StringVar()
         ttk.Label(settings, textvariable=self.dirty).pack(anchor="w", pady=(8, 3))
         edit_actions = ttk.Frame(settings)
@@ -248,7 +272,7 @@ class ControlPanel:
 
         preview = ttk.LabelFrame(body, text="Что видит программа", padding=8)
         body.add(preview, weight=5)
-        self.preview = ttk.Label(preview, text="Кадр появится после захвата области игры", anchor="center")
+        self.preview = ttk.Label(preview, text="Держите клавишу слежения для предпросмотра", anchor="center")
         self.preview.pack(fill="both", expand=True)
         self.reason = tk.StringVar(value="Причина решения: —")
         self.target = tk.StringVar(value="Цель: —    Задержка: —")
@@ -274,10 +298,14 @@ class ControlPanel:
         threading.Thread(target=self.read_states, daemon=True).start()
         root.after(50, self.poll)
         self.send("refresh")
+        root.after(3000, self.refresh_windows)
 
-    def scrollable_tab(self, notebook: Any, title: str) -> Any:
+    def scrollable_tab(self, notebook: Any, title: str, searchable: bool = False) -> Any:
         frame = self.ttk.Frame(notebook)
         notebook.add(frame, text=title)
+        if searchable:
+            self.ttk.Label(frame, text="Поиск по названию или имени параметра").pack(anchor="w", padx=8, pady=(8, 0))
+            self.ttk.Entry(frame, textvariable=self.search).pack(fill="x", padx=8, pady=6)
         canvas = self.tk.Canvas(frame, highlightthickness=0)
         scrollbar = self.ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -289,6 +317,10 @@ class ControlPanel:
         inner.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(handle, width=event.width))
         return inner
+
+    def refresh_windows(self) -> None:
+        self.send("refresh")
+        self.root.after(3000, self.refresh_windows)
 
     def send(self, command: str, **values: Any) -> None:
         try:
@@ -345,8 +377,15 @@ class ControlPanel:
             else:
                 self.windows.set("")
         observing = self.model.settings.get("observe_only", True)
-        self.mode_hint.set("Наблюдение: мышь и автоклики отключены. F8 — стоп; F9 — кадры."
-                           if observing else "Управление мышью включено. F8 — стоп; F9 — сохранить кадры.")
+        window_mode = self.model.settings.get("require_game_window", True)
+        mode_name = "Выбранное окно" if window_mode else "Рабочий стол (основной экран)"
+        self.work_mode.set(mode_name)
+        self.mode_hint.set(mode_name + ": " + ("наблюдение без ввода. " if observing else "управление мышью включено. ")
+                           + "Ctrl — область; Alt — вся область; F8 — стоп.")
+        count = len(self.window_ids)
+        self.window_hint.set(str(state.get("windows_error") or
+            (f"Открытых окон: {count}. Список обновляется автоматически." if count else
+             "Открытые окна не найдены. Откройте приложение и нажмите «Обновить».")))
         self.reason.set("Причина решения: " + str(self.model.state.get("reason") or "—"))
         target = self.model.state.get("target")
         latency = self.model.state.get("latency_ms")
@@ -356,39 +395,69 @@ class ControlPanel:
             self.message.set(str(state["error"] or ""))
         if state.get("preview") and state["preview"] != self.last_preview:
             self.show_preview(state["preview"])
+        elif "preview" in state and state["preview"] is None:
+            self.last_preview = self.preview_image = None
+            self.preview.configure(image="", text="Держите клавишу слежения для предпросмотра")
+
+    def add_setting_row(self, frame: Any, name: str, value: Any,
+                        variable: Any, full: bool = False) -> Any:
+        row = self.ttk.Frame(frame)
+        row.pack(fill="x", pady=4)
+        label = LABELS.get(name, name)
+        if full:
+            label += f"  ({name})" if label != name else ""
+        if isinstance(value, bool):
+            self.ttk.Checkbutton(row, text=label, variable=variable).pack(anchor="w")
+        else:
+            self.ttk.Label(row, text=label, wraplength=420).pack(anchor="w")
+            if name in CHOICES:
+                self.ttk.Combobox(row, textvariable=variable, values=CHOICES[name],
+                                  state="readonly").pack(fill="x")
+            else:
+                self.ttk.Entry(row, textvariable=variable).pack(fill="x")
+        if full:
+            description = self.model.state.get("settings_info", {}).get(name, "")
+            if description:
+                self.ttk.Label(row, text=description, wraplength=420).pack(anchor="w")
+        if name == "exclusion_rects":
+            self.ttk.Label(row, text="[[слева, сверху, справа, снизу], …], доли 0–1",
+                           wraplength=350).pack(anchor="w")
+        return row
 
     def sync_fields(self) -> None:
         self.updating = True
         try:
             for name in sorted(self.model.settings, key=lambda n: (n not in MAIN_SETTINGS,
-                                                                     MAIN_SETTINGS.index(n) if n in MAIN_SETTINGS else n)):
+                                 MAIN_SETTINGS.index(n) if n in MAIN_SETTINGS else n)):
                 value = self.model.settings[name]
                 if name not in self.variables:
-                    frame = self.main_fields if name in MAIN_SETTINGS else self.advanced_fields
-                    row = self.ttk.Frame(frame)
-                    row.pack(fill="x", pady=4)
-                    if isinstance(value, bool):
-                        variable = self.tk.BooleanVar()
-                        self.ttk.Checkbutton(row, text=LABELS.get(name, name), variable=variable).pack(anchor="w")
-                    else:
-                        self.ttk.Label(row, text=LABELS.get(name, name)).pack(anchor="w")
-                        variable = self.tk.StringVar()
-                        if name in CHOICES:
-                            self.ttk.Combobox(row, textvariable=variable, values=CHOICES[name], state="readonly").pack(fill="x")
-                        else:
-                            self.ttk.Entry(row, textvariable=variable).pack(fill="x")
-                        if name == "exclusion_rects":
-                            self.ttk.Label(row, text="[[слева, сверху, справа, снизу], …], доли 0–1",
-                                           wraplength=350).pack(anchor="w")
-                    variable.trace_add("write", lambda *args, key=name: self.edited(key))
+                    variable = self.tk.BooleanVar() if isinstance(value, bool) else self.tk.StringVar()
                     self.variables[name] = variable
+                    self.all_rows[name] = self.add_setting_row(self.all_fields, name, value,
+                                                               variable, full=True)
+                    if name in MAIN_SETTINGS:
+                        self.add_setting_row(self.main_fields, name, value, variable)
+                    variable.trace_add("write", lambda *args, key=name: self.edited(key))
                 displayed = self.model.displayed(name)
                 shown = displayed if isinstance(value, bool) else value_text(displayed)
                 if self.variables[name].get() != shown:
                     self.variables[name].set(shown)
         finally:
             self.updating = False
+        self.filter_settings()
         self.update_dirty()
+
+    def filter_settings(self) -> None:
+        key = (self.search.get().casefold(), tuple(self.all_rows))
+        if key == getattr(self, "_filter_key", None):
+            return
+        self._filter_key = key
+        # Repack in a stable order; hiding a row must not discard its edits.
+        for row in self.all_rows.values():
+            row.pack_forget()
+        for name, row in self.all_rows.items():
+            if setting_matches(name, self.search.get()):
+                row.pack(fill="x", pady=4)
 
     def edited(self, name: str) -> None:
         if not self.updating:
@@ -435,6 +504,15 @@ class ControlPanel:
             self.model.pending.clear()
         self.profile_editing = False
         self.send(command, name=name)
+
+    def select_mode(self, event: Any = None) -> None:
+        mode = WORK_MODES.get(self.work_mode.get())
+        if mode is not None:
+            # Mode changes are immediate; return to observation before input.
+            for name in ("require_game_window", "observe_only"):
+                self.model.edits.pop(name, None)
+                self.model.pending.pop(name, None)
+            self.send("set_mode", mode=mode)
 
     def select_window(self, event: Any = None) -> None:
         index = self.windows.current()

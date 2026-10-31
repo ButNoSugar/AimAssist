@@ -17,6 +17,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
+from contextlib import contextmanager
 
 import sitecustomize  # supplied by tests/run.py: only desktop/input adapters
 import keyboard
@@ -53,11 +54,23 @@ NAMES = {
     'process_pair', 'select_target', 'is_global_motion',
     'window_text', 'window_matches', 'process_name',
     'apply_settings_batch', 'handle_engine_command',
+    'update_aim_context', 'client_rect_on_screen', 'list_windows',
+    'refresh_panel_windows', 'configure_window_api', 'RECT', 'POINT',
 }
 CONSTANTS = {'BOOL_TRUE', 'BOOL_FALSE', 'MIN_VALUES', 'MAX_VALUES',
              'ALLOWED_VALUES', 'MOUSE_KEYS', 'KEY_SETTINGS', 'DEFAULT_PROFILE_NAME',
-             'PROCESS_QUERY_LIMITED_INFORMATION'}
+             'PROCESS_QUERY_LIMITED_INFORMATION', 'WNDENUMPROC'}
 TREE = ast.parse((ROOT / 'aim_tracker.py').read_text(encoding='utf-8'))
+
+
+@contextmanager
+def replaced_attribute(obj, name, value):
+    previous = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, previous)
 
 
 class IntegrationRegressions(unittest.TestCase):
@@ -104,6 +117,8 @@ class IntegrationRegressions(unittest.TestCase):
         g['_aim'] = {'hwnd': 4242, 'viewport': (100, 50, 800, 600),
                      'crosshair': (500, 350), 'relative': True}
         g['_selected_hwnd'] = [None]
+        g['_panel'] = None
+        g['foreground_window_title'] = lambda: (ctypes.windll.WIN['hwnd'], 'Minecraft')
         g['_config_lock'] = threading.RLock()
         g['_config'] = {'data': g['empty_config'](), 'active': 'default',
                         'autosave_ok': True}
@@ -120,6 +135,104 @@ class IntegrationRegressions(unittest.TestCase):
 
     def call(self, name, *args):
         return self.g[name](*args)
+
+    def test_desktop_mode_ignores_game_and_forces_absolute_cursor(self):
+        self.g['cfg'].require_game_window = False
+        self.g['cfg'].aim_mode = 'relative'
+        self.assertIsNone(self.call('update_aim_context'))
+        self.assertFalse(self.g['_aim']['relative'])
+        self.assertEqual(self.g['_aim']['crosshair'], (840, 525))
+        self.assertEqual(self.g['_aim']['hwnd'], 0)
+        ctypes.windll.WIN['hwnd'] = 7
+        self.assertTrue(self.call('input_allowed'))
+
+    def test_mode_command_resets_history_and_returns_to_observation(self):
+        self.g['cfg'].observe_only = False
+        self.g['_prev_holder']['frame'] = np.zeros((10, 10, 4), np.uint8)
+        self.call('handle_engine_command', {'command': 'set_mode', 'mode': 'desktop'})
+        self.assertFalse(self.g['cfg'].require_game_window)
+        self.assertTrue(self.g['cfg'].observe_only)
+        self.assertIsNone(self.g['_prev_holder']['frame'])
+        self.assertFalse(self.g['_aim']['relative'])
+        self.call('handle_engine_command', {'command': 'set_mode', 'mode': 'window'})
+        self.assertTrue(self.g['cfg'].require_game_window)
+        self.assertEqual(self.g['_aim']['viewport'], (100, 50, 800, 600))
+        self.assertTrue(self.g['_aim']['relative'])
+
+    def test_desktop_click_is_checked_after_cursor_arrives(self):
+        self.input_spies()
+        self.g['cfg'].require_game_window = False
+        self.g['cfg'].observe_only = False
+        self.g['_aim']['relative'] = False
+        cursor = [0, 0]
+        def move(x, y):
+            self.actions.append(('absolute', (x, y)))
+            cursor[:] = [x, y]
+        self.g['move_absolute_to_target'] = move
+        self.g['target_is_centred'] = lambda x, y: tuple(cursor) == (x, y)
+        self.assertTrue(self.call('move_and_maybe_click', 150, 200))
+        self.assertEqual(self.actions, [('absolute', (150, 200)), ('click',)])
+
+    def test_window_catalog_includes_small_and_pointer_sized_handles(self):
+        large = (1 << 40) + 42
+        additions = {large: ('Large HWND', 'app.exe', 0, 0, 500, 400),
+                     27: ('Small tool', 'tool.exe', 0, 0, 50, 40)}
+        windows = ctypes.windll.WIN['windows']
+        original = dict(windows)
+        windows.update(additions)
+        try:
+            result = self.call('list_windows')
+        finally:
+            windows.clear()
+            windows.update(original)
+        ids = {item[0] for item in result}
+        self.assertIn(large, ids)
+        self.assertIn(27, ids)
+
+    def test_process_metadata_failure_does_not_hide_window(self):
+        self.g['process_name'] = lambda hwnd: (_ for _ in ()).throw(OSError('denied'))
+        result = self.call('list_windows')
+        self.assertTrue(result)
+        self.assertTrue(all(item[2] == '' for item in result))
+
+    def test_failed_windows_enumeration_is_not_reported_as_empty_success(self):
+        with replaced_attribute(ctypes.windll.user32, 'EnumWindows', lambda *args: 0):
+            with self.assertRaisesRegex(OSError, 'перечислить'):
+                self.call('list_windows')
+
+    def test_partial_desktop_movement_does_not_click_before_arrival(self):
+        self.input_spies()
+        self.g['cfg'].require_game_window = False
+        self.g['cfg'].observe_only = False
+        self.g['_aim']['relative'] = False
+        self.g['move_absolute_to_target'] = lambda x, y: self.actions.append(('partial', (x, y)))
+        self.g['target_is_centred'] = lambda x, y: False
+        self.call('move_and_maybe_click', 150, 200)
+        self.assertEqual(self.actions, [('partial', (150, 200))])
+
+    def test_window_refresh_keeps_last_catalog_and_reports_failure(self):
+        previous = [{'id': 7, 'title': 'Notepad', 'exe': 'notepad.exe'}]
+        self.g['_runtime']['windows'] = previous
+        self.g['_runtime']['error'] = 'invalid setting'
+        self.g['list_windows'] = lambda: (_ for _ in ()).throw(OSError('enumeration failed'))
+        self.call('handle_engine_command', {'command': 'refresh'})
+        self.assertEqual(self.g['_runtime']['windows'], previous)
+        self.assertIn('enumeration failed', self.g['_runtime']['windows_error'])
+        self.assertEqual(self.g['_runtime']['error'], 'invalid setting')
+
+    def test_window_api_uses_pointer_sized_hwnd_and_process_handles(self):
+        class Function:
+            pass
+        user32 = SimpleNamespace(**{name: Function() for name in (
+            'GetForegroundWindow', 'GetWindowTextW', 'EnumWindows')})
+        kernel32 = SimpleNamespace(**{name: Function() for name in ('OpenProcess', 'CloseHandle')})
+        with replaced_attribute(ctypes, 'windll', SimpleNamespace(user32=user32, kernel32=kernel32)):
+            self.call('configure_window_api')
+        self.assertIs(user32.GetForegroundWindow.restype, ctypes.c_void_p)
+        self.assertIs(kernel32.OpenProcess.restype, ctypes.c_void_p)
+        self.assertIs(user32.GetWindowTextW.argtypes[0], ctypes.c_void_p)
+        self.assertIs(kernel32.CloseHandle.argtypes[0], ctypes.c_void_p)
+        self.assertIs(self.g['WNDENUMPROC']._restype_, ctypes.c_int)
 
     def prepare_frames(self, region=(0, 0, 30, 30)):
         g = self.g

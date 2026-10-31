@@ -500,10 +500,45 @@ _window_cache = {"hwnd": 0, "title": "", "ts": 0.0}
 # EnumWindows хочет функцию по соглашению stdcall; на не-Windows такого типа
 # в ctypes нет, и подставляется обычный — туда мы всё равно не попадаем.
 WNDENUMPROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
-    ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_ssize_t)
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-MIN_PICKABLE_SIDE = 200          # окна мельче — служебные, в списке только мешают
+
+
+def configure_window_api():
+    """Preserve pointer-sized HWND/HANDLE values on 64-bit Windows."""
+    pointer, integer, dword = ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong
+    signatures = {
+        "user32": {
+            "GetForegroundWindow": ([], pointer),
+            "GetParent": ([pointer], pointer),
+            "IsWindowVisible": ([pointer], integer),
+            "GetWindowTextLengthW": ([pointer], integer),
+            "GetWindowTextW": ([pointer, ctypes.c_wchar_p, integer], integer),
+            "GetClientRect": ([pointer, ctypes.POINTER(RECT)], integer),
+            "ClientToScreen": ([pointer, ctypes.POINTER(POINT)], integer),
+            "GetWindowThreadProcessId": ([pointer, ctypes.POINTER(dword)], dword),
+            "EnumWindows": ([WNDENUMPROC, ctypes.c_ssize_t], integer),
+            "GetWindowLongW": ([pointer, integer], ctypes.c_long),
+            "SetWindowLongW": ([pointer, integer, ctypes.c_long], ctypes.c_long),
+        },
+        "kernel32": {
+            "OpenProcess": ([dword, integer, dword], pointer),
+            "QueryFullProcessImageNameW": (
+                [pointer, dword, ctypes.c_wchar_p, ctypes.POINTER(dword)], integer),
+            "CloseHandle": ([pointer], integer),
+        },
+    }
+    for library, functions in signatures.items():
+        dll = getattr(ctypes.windll, library)
+        for name, (arguments, result) in functions.items():
+            function = getattr(dll, name, None)
+            if function is not None:
+                try:
+                    function.argtypes, function.restype = arguments, result
+                except AttributeError:
+                    # Python methods in the Linux test adapters have no ABI.
+                    pass
 
 
 def process_name(hwnd):
@@ -525,33 +560,51 @@ def process_name(hwnd):
         buffer = ctypes.create_unicode_buffer(size.value)
         if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
             return ""
-        return os.path.basename(buffer.value)
+        return buffer.value.replace("\\", "/").rsplit("/", 1)[-1]
     finally:
         kernel32.CloseHandle(handle)
 
 
 def list_windows():
-    """Видимые окна, в которые есть смысл целиться: [(hwnd, заголовок, exe, область)].
+    """Visible titled top-level windows, including small/minimized windows.
 
-    Показываем ОКНА, а не процессы: у одной программы процессов бывает
-    несколько, и в диспетчере задач не понять, который из них рисует картинку.
+    Process metadata is optional: access denied must not hide an entire window.
+    Exceptions cannot escape a ctypes callback; retain them for diagnostics.
     """
-    found = []
+    found, errors = [], []
+    own_pids = {os.getpid()}
+    panel_process = getattr(_panel, "process", None)
+    if panel_process is not None:
+        own_pids.add(panel_process.pid)
 
     def _collect(hwnd, _lparam):
-        if not ctypes.windll.user32.IsWindowVisible(hwnd):
-            return True
-        title = window_text(hwnd)
-        if not title.strip():
-            return True
-        rect = client_rect_on_screen(hwnd)
-        if rect is None or rect[2] < MIN_PICKABLE_SIDE or rect[3] < MIN_PICKABLE_SIDE:
-            return True
-        found.append((hwnd, title, process_name(hwnd), rect))
+        try:
+            user32 = ctypes.windll.user32
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            title = window_text(hwnd)
+            if not title.strip():
+                return True
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in own_pids:
+                return True
+            rect = client_rect_on_screen(hwnd) or (0, 0, 0, 0)
+            try:
+                exe = process_name(hwnd)
+            except (OSError, ValueError, OverflowError):
+                exe = ""
+            found.append((int(hwnd), title, exe, rect))
+        except Exception as exc:
+            errors.append(str(exc))
         return True
 
-    ctypes.windll.user32.EnumWindows(WNDENUMPROC(_collect), 0)
-    return found
+    if not ctypes.windll.user32.EnumWindows(WNDENUMPROC(_collect), 0):
+        raise OSError("Windows не удалось перечислить окна")
+    _runtime["window_errors"] = errors
+    if errors and not found:
+        raise OSError("Не удалось прочитать окна: " + errors[0])
+    return sorted(found, key=lambda item: (item[1].casefold(), item[0]))
 
 
 def window_matches(title, exe):
@@ -639,7 +692,7 @@ def update_aim_context():
     Возвращает область игры или None (обычный рабочий стол).
     """
     viewport = None
-    if cfg.window_exe.strip() or cfg.window_title.strip():
+    if cfg.require_game_window and (cfg.window_exe.strip() or cfg.window_title.strip()):
         hwnd, title = foreground_window_title()
         # exe спрашиваем только когда он задан: это обращение к чужому процессу
         exe = process_name(hwnd) if (hwnd and cfg.window_exe.strip()) else ""
@@ -655,7 +708,7 @@ def update_aim_context():
     _aim["hwnd"], _aim["viewport"] = identity
     if viewport is None:
         _aim["crosshair"] = (center_x, center_y)
-        _aim["relative"] = cfg.aim_mode == "relative"
+        _aim["relative"] = cfg.require_game_window and cfg.aim_mode == "relative"
     else:
         left, top, width, height = viewport
         _aim["crosshair"] = (left + width // 2, top + height // 2)
@@ -897,6 +950,7 @@ class FrameGrabber:
 
 # ---------- Инициализация ----------
 require_windows()
+configure_window_api()
 
 screen_width, screen_height = pyautogui.size()
 center_x, center_y = screen_width // 2, screen_height // 2
@@ -1329,13 +1383,15 @@ def move_and_maybe_click(x, y):
     """Наводит на цель (x, y) в экранных координатах и, если включено, кликает."""
     if cfg.observe_only or not input_allowed():
         return False
-    # считаем ДО движения: вопрос в том, была ли цель в прицеле, когда мы её увидели
+    # Camera motion needs a new frame; desktop cursor position can be verified
+    # immediately after an absolute move, including partial/smoothed moves.
     aimed = cfg.auto_click and target_is_centred(x, y)
 
     if _aim["relative"]:
         move_relative_to_target(x, y)
     else:
         move_absolute_to_target(x, y)
+        aimed = cfg.auto_click and target_is_centred(x, y)
     hold_after_action()
 
     if aimed and not _stop.is_set() and input_allowed() and click_is_due():
@@ -1785,6 +1841,10 @@ def assign_setting(name, value):
     if name == "overlay_enabled":
         set_overlay_enabled(value)
         return
+    if name == "require_game_window" and value != cfg.require_game_window:
+        cfg.observe_only = True
+        _runtime["preview"] = None
+        _runtime["reason"] = "режим изменён — наблюдение без ввода"
     setattr(cfg, name, value)
     if name in ("window_exe", "window_title"):
         _selected_hwnd[0] = None
@@ -1902,7 +1962,7 @@ SETTINGS_GROUPS = [
 SETTINGS_GROUPS.append(
     ('Проверка и фильтры',
      (('observe_only', 'наблюдение без движений и кликов'),
-      ('require_game_window', 'пауза, когда выбранное окно игры неактивно'),
+      ('require_game_window', 'on = выбранное окно, off = рабочий стол с обычным курсором'),
       ('confirm_frames', 'сколько последовательных детекций подтверждают цель'),
       ('max_blob_fraction', 'максимальная доля полезной области, занятая пятном'),
       ('max_aspect_ratio', 'максимальное отношение длинной стороны пятна к короткой'),
@@ -2004,7 +2064,7 @@ def describe_setting(name):
 SETTINGS_HELP = {
     'overlay_enabled': 'ВКЛ (рамка): синхронный захват с ожиданием скрытия рамок и интервалом pair_interval между кадрами. ВЫКЛ (быстрый): фоновые кадры с ограничением частоты захвата. Оба режима используют один детектор. Рамки удобны для настройки, но добавляют задержку. Предпросмотр в панели доступен в обоих режимах.',
 
-    'aim_mode': 'auto выбирает относительные движения в активном окне игры. relative всегда использует относительные отсчёты мыши, absolute — положение курсора. По умолчанию require_game_window запрещает действия вне игры; observe_only запрещает весь ввод независимо от режима.',
+    'aim_mode': 'Способ движения внутри выбранного окна: auto/relative используют относительные отсчёты мыши, absolute — обычный курсор. В режиме рабочего стола всегда используется абсолютное движение независимо от этой настройки. observe_only запрещает весь ввод.',
 
     "camera_gain": """\
 Насколько резко доворачивать камеру за кадр, от 0.01 до 5.
@@ -2339,12 +2399,10 @@ margin. 0 — не показывать.
 
 
 SETTINGS_HELP.update(
-    {'observe_only': 'При каждом запуске и загрузке профиля включено наблюдение. Сначала '
-                     'проверь рамки и маску; set observe_only off разрешает ввод только в '
-                     'активном окне игры.',
-     'require_game_window': 'По умолчанию on. При Alt+Tab ввод останавливается и история '
-                            'кадров сбрасывается. Выключать только для явного эксперимента с '
-                            'рабочим столом.',
+    {'observe_only': 'При запуске, загрузке профиля и смене рабочей области включено '
+                     'наблюдение. Проверь рамки и маску; set observe_only off разрешает '
+                     'ввод в выбранном активном окне или на рабочем столе в зависимости от режима.',
+     'require_game_window': 'on: работа в выбранном активном окне; Alt+Tab приостанавливает ввод. off: рабочий стол основного экрана, обычный курсор и абсолютное движение независимо от aim_mode. Переключение включает наблюдение и сбрасывает историю кадров.',
      'confirm_frames': 'Два подтверждения уменьшают одиночные ложные срабатывания. Для '
                        'коротких частиц можно поставить 1 после проверки на записях; большее '
                        'значение повышает задержку.',
@@ -2431,15 +2489,14 @@ def pick_window():
         print(paint("[Окно]", "red"), f"не удалось перечислить окна: {exc}")
         return
     if not windows:
-        print(paint("[Окно]", "yellow"), "подходящих окон не найдено.")
-        return
+        print(paint("[Окно]", "yellow"), "открытых окон не найдено; доступен рабочий стол.")
 
     print()
     for number, (_hwnd, title, exe, (left, top, width, height)) in enumerate(windows, 1):
         short = title if len(title) <= 42 else title[:41] + "…"
         print(f"  {paint(str(number).rjust(2), 'cyan')}  {short:<43}"
               f"{paint(exe or '?', 'green'):<22}{paint(f'{width}x{height}', 'dim')}")
-    print(f"\n  {paint('0', 'cyan')}   не привязываться к окну (прицел в центре экрана)")
+    print(f"\n  {paint('0', 'cyan')}   рабочий стол (обычный курсор, основной экран)")
 
     try:
         answer = input("\n  Номер окна: ").strip()
@@ -2452,6 +2509,7 @@ def pick_window():
     choice = int(answer)
     if choice == 0:
         with _state_lock:
+            assign_setting("require_game_window", False)
             cfg.window_exe = ""
             cfg.window_title = ""
             _selected_hwnd[0] = None
@@ -2461,6 +2519,8 @@ def pick_window():
 
     hwnd, title, exe, _rect = windows[choice - 1]
     with _state_lock:
+        if not cfg.require_game_window:
+            assign_setting("require_game_window", True)
         _selected_hwnd[0] = hwnd
         cfg.window_exe = exe
         cfg.window_title = title
@@ -2487,7 +2547,9 @@ def print_window_info():
     print(f"  {paint('window pick', 'cyan')} — выбрать окно из списка")
 
     last = _aim["last_match"]
-    if last is None:
+    if not cfg.require_game_window:
+        print(f"  Рабочий стол: основной экран {screen_width}x{screen_height}, обычный курсор.")
+    elif last is None:
         print("  " + paint("Окно игры ещё ни разу не попадалось.", "yellow"))
         print(f"  Прицел: центр экрана ({center_x}, {center_y}).")
     else:
@@ -3130,7 +3192,9 @@ def print_header():
     print()
 
     last = _aim["last_match"]
-    if last is None:
+    if not cfg.require_game_window:
+        where = f"рабочий стол, основной экран {screen_width}x{screen_height}, обычный курсор"
+    elif last is None:
         where = f"окно игры не найдено, прицел в центре экрана ({center_x}, {center_y})"
     else:
         title, (left, top, w, h) = last
@@ -3148,15 +3212,23 @@ def print_header():
 
 
 def refresh_panel_windows():
+    try:
+        windows = list_windows()
+    except (OSError, ValueError, OverflowError) as exc:
+        _runtime["windows_error"] = str(exc)
+        return
     _runtime["windows"] = [{"id": hwnd, "title": title, "exe": exe}
-                           for hwnd, title, exe, _rect in list_windows()]
+                           for hwnd, title, exe, _rect in windows]
+    errors = _runtime.get("window_errors", [])
+    _runtime["windows_error"] = (f"Не удалось прочитать окон: {len(errors)}" if errors else "")
 
 
 @state_locked
 def handle_engine_command(command):
     """UI and hotkeys enqueue work; changes apply between detection iterations."""
     kind = command.get("command")
-    _runtime["error"] = ""
+    if kind != "refresh":
+        _runtime["error"] = ""
     try:
         if kind == "set_many":
             apply_settings_batch(command.get("settings"))
@@ -3169,11 +3241,19 @@ def handle_engine_command(command):
             if error:
                 raise ValueError(error)
             assign_setting(name, value)
+        elif kind == "set_mode":
+            mode = command.get("mode")
+            if mode not in ("window", "desktop"):
+                raise ValueError("режим должен быть window или desktop")
+            apply_settings_batch({"require_game_window": mode == "window", "observe_only": True})
+            update_aim_context()
         elif kind == "select_window":
             hwnd = command.get("id")
             window = next((w for w in _runtime["windows"] if str(w["id"]) == str(hwnd)), None)
             if window is None:
                 raise ValueError("окно уже недоступно; обновите список")
+            if not cfg.require_game_window:
+                assign_setting("require_game_window", True)
             _selected_hwnd[0] = window["id"]
             cfg.window_exe, cfg.window_title = window["exe"], window["title"]
             _runtime["dirty"] = True
@@ -3223,8 +3303,11 @@ def publish_panel():
               "наблюдение" if cfg.observe_only else "слежение")
     _panel.publish({"status": status, "profile": _config["active"],
                     "profiles": profile_names(), "settings": current_values(),
+                    "settings_info": SETTINGS_INFO,
                     "windows": _runtime["windows"], "dirty": _runtime["dirty"],
                     "window_id": _selected_hwnd[0] or _aim["hwnd"],
+                    "work_mode": "window" if cfg.require_game_window else "desktop",
+                    "windows_error": _runtime.get("windows_error", ""),
                     "target": _stat["target"], "reason": _runtime["reason"],
                     "latency_ms": _stat["ms"], "frame_age_ms": _runtime["frame_age_ms"],
                     "preview": _runtime["preview"], "error": _runtime["error"]})
